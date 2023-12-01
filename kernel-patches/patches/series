@@ -1238,3 +1238,5 @@
 0021-drm-i915-huc-Update-HuC-MTL-FW-version-to-8.4.3.drm
 0022-drm-i915-huc-load-HuC-via-non-POR-GSC-engine-flow.drm
 0001-drm-i915-uc-Update-MTL-GSC-HuC-Firmware.drm
+0001-intel-ipu-driver-with-innodisk.camera
+0001-innodisk-v4l2-driver-with-intel-ipu.camera
