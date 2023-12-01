@@ -1,0 +1,253 @@
+Index: linux-kernel-v6.2/drivers/media/platform/intel/ipu6-acpi.c
+===================================================================
+--- linux-kernel-v6.2.orig/drivers/media/platform/intel/ipu6-acpi.c
++++ linux-kernel-v6.2/drivers/media/platform/intel/ipu6-acpi.c
+@@ -42,6 +42,7 @@
+ #include <media/imx390.h>
+ #include <media/ti960.h>
+ #include <media/d4xx_pdata.h>
++#include <media/ev2m_gom1.h>
+ 
+ static LIST_HEAD(devices);
+ 
+@@ -66,6 +67,7 @@ static const struct ipu_acpi_devices sup
+ 	{ "INTC10B1", LT6911UXC_NAME, get_sensor_pdata, NULL, 0, TYPE_DIRECT, NULL },	// Lontium HID
+ 	{ "INTC10C1", IMX390_NAME, get_sensor_pdata, NULL, 0, TYPE_SERDES, TI960_NAME },// IMX390 HID
+ 	{ "INTC10CD", D457_NAME, get_sensor_pdata, NULL, 0, TYPE_SERDES, D457_NAME },// D457 HID
++	{ "EV2MGOM1", EV2MGOM1_NAME, get_sensor_pdata, NULL, 0, TYPE_DIRECT, NULL },	// EV2M-GOM1 HID
+ };
+ 
+ static int get_table_index(struct device *device, const __u8 *acpi_name)
+@@ -90,6 +92,7 @@ static const struct acpi_device_id ipu_a
+ 	{ "INTC10B1", 0 },	// Lontium HID
+ 	{ "INTC10C1", 0 },	// IMX390 HID
+ 	{ "INTC10CD", 0 },	// D457 HID
++	{ "EV2MGOM1", 0 },	// EV2M-GOM1 HID
+ 	{},
+ };
+ static int ipu_acpi_get_pdata(struct i2c_client *client,
+Index: linux-kernel-v6.2/drivers/media/platform/intel/ipu6-adlrvp-pdata.c
+===================================================================
+--- linux-kernel-v6.2.orig/drivers/media/platform/intel/ipu6-adlrvp-pdata.c
++++ linux-kernel-v6.2/drivers/media/platform/intel/ipu6-adlrvp-pdata.c
+@@ -19,6 +19,9 @@
+ #if IS_ENABLED(CONFIG_VIDEO_LT6911UXC)
+ #include <media/lt6911uxc.h>
+ #endif
++#if IS_ENABLED(CONFIG_VIDEO_EV2M_GOM1)
++#include <media/ev2m_gom1.h>
++#endif
+ #if IS_ENABLED(CONFIG_VIDEO_D4XX)
+ #include <media/d4xx_pdata.h>
+ #endif
+@@ -488,6 +491,95 @@ static struct ipu_isys_subdev_info lt691
+ };
+ #endif
+ 
++#if IS_ENABLED(CONFIG_VIDEO_EV2M_GOM1)
++#define EV2M_GOM1_LANES       2
++#define EV2M_GOM1_I2C_ADDRESS 0x08
++
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA) \
++	&& IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_PDATA_DYNAMIC_LOADING)
++static void ev2m_gom1_fixup_spdata(const void *spdata_rep, void *spdata)
++{
++	const struct ipu_spdata_rep *rep = spdata_rep;
++	struct ev2m_gom1_platform_data *platform = spdata;
++
++	if (spdata_rep && spdata) {
++		platform->port = rep->port_n;
++		platform->lanes = rep->lanes;
++		platform->i2c_slave_address = rep->slave_addr_n;
++		platform->gpios[0] = rep->gpios[0];
++		platform->irq_pin = rep->irq_pin;
++		platform->irq_pin_flags = rep->irq_pin_flags;
++		strcpy(platform->irq_pin_name, rep->irq_pin_name);
++		platform->suffix = rep->suffix;
++	}
++}
++#endif
++
++static struct ipu_isys_csi2_config ev2m_gom1_csi2_cfg_1 = {
++	.nlanes = EV2M_GOM1_LANES,
++	.port = 1,
++};
++
++static struct ev2m_gom1_platform_data ev2m_gom1_pdata_1 = {
++	.port = 1,
++	.lanes = EV2M_GOM1_LANES,
++	.i2c_slave_address = EV2M_GOM1_I2C_ADDRESS,
++	.irq_pin = -1,
++	.irq_pin_name = "",
++	.irq_pin_flags = IRQF_TRIGGER_RISING
++		| IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
++	.suffix = 'a',
++	.gpios = {-1, 0, 0, 0},
++};
++
++static struct ipu_isys_subdev_info  ev2m_gom1_sd_1 = {
++	.csi2 = &ev2m_gom1_csi2_cfg_1,
++	.i2c = {
++	.board_info = {
++		I2C_BOARD_INFO("ev2m_gom1", EV2M_GOM1_I2C_ADDRESS),
++		.platform_data = &ev2m_gom1_pdata_1,
++	},
++	.i2c_adapter_bdf = "0000:00:15.1",
++	},
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA) \
++	&& IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_PDATA_DYNAMIC_LOADING)
++	.fixup_spdata = ev2m_gom1_fixup_spdata,
++#endif
++};
++
++static struct ipu_isys_csi2_config ev2m_gom1_csi2_cfg_2 = {
++	.nlanes = EV2M_GOM1_LANES,
++	.port = 2,
++};
++
++static struct ev2m_gom1_platform_data ev2m_gom1_pdata_2 = {
++	.port = 2,
++	.lanes = EV2M_GOM1_LANES,
++	.i2c_slave_address = EV2M_GOM1_I2C_ADDRESS,
++	.irq_pin = -1,
++	.irq_pin_name = "",
++	.irq_pin_flags = IRQF_TRIGGER_RISING
++		| IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
++	.suffix = 'b',
++	.gpios = {-1, 0, 0, 0},
++};
++
++static struct ipu_isys_subdev_info ev2m_gom1_sd_2 = {
++	.csi2 = &ev2m_gom1_csi2_cfg_2,
++	.i2c = {
++	.board_info = {
++		I2C_BOARD_INFO("ev2m_gom1", EV2M_GOM1_I2C_ADDRESS),
++		.platform_data = &ev2m_gom1_pdata_2,
++	},
++	.i2c_adapter_bdf = "0000:00:19.1",
++	},
++#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA) \
++	&& IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_PDATA_DYNAMIC_LOADING)
++	.fixup_spdata = ev2m_gom1_fixup_spdata,
++#endif
++};
++#endif
++
+ #if IS_ENABLED(CONFIG_VIDEO_D4XX)
+ #define D4XX_LANES       2
+ #define D4XX_I2C_ADDRESS_0 0x10
+@@ -597,6 +689,10 @@ static struct ipu_isys_subdev_pdata pdat
+ 		&lt6911uxc_sd_1,
+ 		&lt6911uxc_sd_2,
+ #endif
++#if IS_ENABLED(CONFIG_VIDEO_EV2M_GOM1)
++		&ev2m_gom1_sd_1,
++		&ev2m_gom1_sd_2,
++#endif
+ #if IS_ENABLED(CONFIG_VIDEO_D4XX)
+ 		&d4xx_sd_0,
+ 		&d4xx_sd_1,
+Index: linux-kernel-v6.2/drivers/media/platform/intel/ipu6-tglrvp-pdata.c
+===================================================================
+--- linux-kernel-v6.2.orig/drivers/media/platform/intel/ipu6-tglrvp-pdata.c
++++ linux-kernel-v6.2/drivers/media/platform/intel/ipu6-tglrvp-pdata.c
+@@ -12,6 +12,7 @@
+ #include <media/ar0234.h>
+ #include <media/imx390.h>
+ #include <media/lt6911uxc.h>
++#include <media/ev2m_gom1.h>
+ 
+ #include "ipu.h"
+ 
+@@ -590,6 +591,68 @@ static struct ipu_isys_subdev_info lt691
+ };
+ #endif
+ 
++#if IS_ENABLED(CONFIG_VIDEO_EV2M_GOM1)
++
++#define EV2M_GOM1_LANES       2
++#define EV2M_GOM1_I2C_ADDRESS 0x08
++
++static struct ipu_isys_csi2_config ev2m_gom1_csi2_cfg_1 = {
++	.nlanes = EV2M_GOM1_LANES,
++	.port = 1,
++};
++
++static struct ev2m_gom1_platform_data ev2m_gom1_pdata_1 = {
++	.port = 1,
++	.lanes = EV2M_GOM1_LANES,
++	.i2c_slave_address = EV2M_GOM1_I2C_ADDRESS,
++	.irq_pin = -1,
++	.irq_pin_name = "B23",
++	.irq_pin_flags = IRQF_TRIGGER_RISING
++		| IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
++	.suffix = 'a',
++	.gpios = {-1, 0, 0, 0},
++};
++
++static struct ipu_isys_subdev_info  ev2m_gom1_sd_1 = {
++	.csi2 = &ev2m_gom1_csi2_cfg_1,
++	.i2c = {
++	.board_info = {
++		I2C_BOARD_INFO("ev2m_gom1", EV2M_GOM1_I2C_ADDRESS),
++		.platform_data = &ev2m_gom1_pdata_1,
++	},
++	.i2c_adapter_bdf = "0000:00:15.3",
++	},
++};
++
++static struct ipu_isys_csi2_config ev2m_gom1_csi2_cfg_2 = {
++	.nlanes = EV2M_GOM1_LANES,
++	.port = 2,
++};
++
++static struct ev2m_gom1_platform_data ev2m_gom1_pdata_2 = {
++	.port = 2,
++	.lanes = EV2M_GOM1_LANES,
++	.i2c_slave_address = EV2M_GOM1_I2C_ADDRESS,
++	.irq_pin = -1,
++	.irq_pin_name = "R6",
++	.irq_pin_flags = IRQF_TRIGGER_RISING
++		| IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
++	.suffix = 'b',
++	.gpios = {-1, 0, 0, 0},
++};
++
++static struct ipu_isys_subdev_info ev2m_gom1_sd_2 = {
++	.csi2 = &ev2m_gom1_csi2_cfg_2,
++	.i2c = {
++	.board_info = {
++		I2C_BOARD_INFO("ev2m_gom1", EV2M_GOM1_I2C_ADDRESS),
++		.platform_data = &ev2m_gom1_pdata_2,
++	},
++	.i2c_adapter_bdf = "0000:00:19.1",
++	},
++};
++#endif
++
+ static struct ipu_isys_clk_mapping clk_mapping[] = {
+ 	{ CLKDEV_INIT(NULL, NULL, NULL), NULL }
+ };
+@@ -624,6 +687,10 @@ static struct ipu_isys_subdev_pdata pdat
+ 		&lt6911uxc_sd_1,
+ 		&lt6911uxc_sd_2,
+ #endif
++#if IS_ENABLED(CONFIG_VIDEO_EV2M_GOM1)
++		&ev2m_gom1_sd_1,
++		&ev2m_gom1_sd_2,
++#endif
+ 		NULL,
+ 	},
+ 	.clk_map = clk_mapping,
+Index: linux-kernel-v6.2/include/media/ipu-acpi-pdata.h
+===================================================================
+--- linux-kernel-v6.2.orig/include/media/ipu-acpi-pdata.h
++++ linux-kernel-v6.2/include/media/ipu-acpi-pdata.h
+@@ -7,6 +7,7 @@
+ #include <media/ti960.h>
+ #include <media/imx390.h>
+ #include <media/d4xx_pdata.h>
++#include <media/ev2m_gom1.h>
+ 
+ #define CL_EMPTY 0
+ #define CL_DISCRETE 1

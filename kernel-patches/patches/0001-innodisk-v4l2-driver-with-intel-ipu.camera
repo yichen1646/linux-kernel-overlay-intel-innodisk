@@ -1,0 +1,951 @@
+Index: linux-kernel-v6.2/drivers/media/i2c/Kconfig
+===================================================================
+--- linux-kernel-v6.2.orig/drivers/media/i2c/Kconfig
++++ linux-kernel-v6.2/drivers/media/i2c/Kconfig
+@@ -1644,6 +1644,16 @@ config VIDEO_LT6911UXC
+ 
+ 	To compile this driver as a module, choose M here: the
+ 	module will be called lt6911uxc.
++
++config VIDEO_EV2M_GOM1
++	tristate "Innodisk EV2M_GOM1 module driver"
++	depends on I2C && VIDEO_V4L2_SUBDEV_API
++	help
++	This is a Video4Linux2 driver for the Innodisk EV2M_GOM1 camera module.
++
++	To compile this driver as a module, choose M here: the
++	module will be called ev2m_gom1.
++
+ endmenu
+ 
+ endif # VIDEO_DEV
+Index: linux-kernel-v6.2/drivers/media/i2c/Makefile
+===================================================================
+--- linux-kernel-v6.2.orig/drivers/media/i2c/Makefile
++++ linux-kernel-v6.2/drivers/media/i2c/Makefile
+@@ -146,3 +146,4 @@ obj-$(CONFIG_VIDEO_VS6624) += vs6624.o
+ obj-$(CONFIG_VIDEO_WM8739) += wm8739.o
+ obj-$(CONFIG_VIDEO_WM8775) += wm8775.o
+ obj-$(CONFIG_VIDEO_LT6911UXC) += lt6911uxc.o
++obj-$(CONFIG_VIDEO_EV2M_GOM1) += ev2m_gom1.o
+Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
+===================================================================
+--- /dev/null
++++ linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
+@@ -0,0 +1,887 @@
++// SPDX-License-Identifier: GPL-2.0
++// Copyright (c) 2022 Intel Corporation.
++
++#include <asm/unaligned.h>
++#include <linux/acpi.h>
++#include <linux/delay.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/pm_runtime.h>
++#include <linux/gpio.h>
++#include <linux/version.h>
++#include <linux/interrupt.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-fwnode.h>
++#include <media/ev2m_gom1.h>
++#include <linux/version.h>
++
++#include <linux/ipu-isys.h>
++
++#define GL3004_REG_VALUE_08BIT			1
++#define GL3004_REG_VALUE_16BIT			2
++
++#define GL3004_REG_CHIP_ID				0x0A50
++#define GL3004_CHIP_ID					0x3004
++
++#define GL3004_LINK_FREQ_62_208MHZ		62208000ULL
++
++#define GL3004_CID_CSI_PORT         	(V4L2_CID_USER_BASE | 0x1001)
++#define GL3004_CID_I2C_BUS         		(V4L2_CID_USER_BASE | 0x1002)
++#define GL3004_CID_I2C_ID         		(V4L2_CID_USER_BASE | 0x1003)
++#define GL3004_CID_I2C_SLAVE_ADDRESS	(V4L2_CID_USER_BASE | 0x1004)
++#define GL3004_CID_FPS         			(V4L2_CID_USER_BASE | 0x1005)
++#define GL3004_CID_FRAME_INTERVAL		(V4L2_CID_USER_BASE | 0x1006)
++
++#define to_GL3004(_sd)					container_of(_sd, struct GL3004, sd)
++
++#define MIPI_CSI2_TYPE_YUV422_8			0x1e
++
++struct GL3004_mode {
++	/* Frame width in pixels */
++	u32 width;
++
++	/* Frame height in pixels */
++	u32 height;
++
++	/* Horizontal timining size */
++	u32 hts;
++
++	/* Default vertical timining size */
++	u32 vts_def;
++
++	/* Min vertical timining size */
++	u32 vts_min;
++
++	/* Link frequency needed for this resolution */
++	u32 link_freq_index;
++
++	/* MEDIA_BUS_FMT */
++	u32 code;
++
++	/* MIPI_LANES */
++	s32 lanes;
++
++	/* MODE_FPS*/
++	u32 fps;
++
++	/* bit per pixel */
++	u32 bpp;
++};
++
++static const s64 link_freq_menu_items[] = {
++	GL3004_LINK_FREQ_62_208MHZ,
++};
++
++static const struct GL3004_mode supported_modes[] = {
++	{
++		.width 			 = 1920,
++		.height 		 = 1080,
++		.code 	 		 = MEDIA_BUS_FMT_UYVY8_1X16,
++		.lanes 	 		 = 2,
++		.fps 	 		 = 30,
++		.bpp 			 = 8,
++	},
++};
++
++static u32 supported_formats[] = {
++	MEDIA_BUS_FMT_UYVY8_1X16,
++};
++
++struct GL3004 {
++	struct v4l2_subdev sd;
++	struct media_pad pad;
++	struct v4l2_ctrl_handler ctrl_handler;
++
++	/* V4L2 Controls */
++	struct v4l2_ctrl *link_freq;
++	struct v4l2_ctrl *vblank;
++	struct v4l2_ctrl *exposure;
++	struct v4l2_ctrl *analogue_gain;
++	struct v4l2_ctrl *digital_gain;
++	struct v4l2_ctrl *strobe_source;
++	struct v4l2_ctrl *strobe;
++	struct v4l2_ctrl *strobe_stop;
++	struct v4l2_ctrl *timeout;
++	struct v4l2_ctrl *csi_port;
++	struct v4l2_ctrl *i2c_bus;
++	struct v4l2_ctrl *i2c_id;
++	struct v4l2_ctrl *i2c_slave_address;
++	struct v4l2_ctrl *fps;
++	struct v4l2_ctrl *frame_interval;
++	struct v4l2_ctrl *pixel_rate;
++	struct v4l2_ctrl *hblank;
++	struct v4l2_ctrl *vflip;
++	struct v4l2_ctrl *hflip;
++	struct v4l2_ctrl *query_sub_stream;
++	struct v4l2_ctrl *set_sub_stream;
++
++	/* Current mode */
++	const struct GL3004_mode *cur_mode;
++
++	/* To serialize asynchronus callbacks */
++	struct mutex mutex;
++
++	/* Streaming on/off */
++	bool streaming;
++
++	struct ev2m_gom1_platform_data *platform_data;
++
++	s64 sub_stream;
++};
++
++static int GL3004_read_reg(struct GL3004 *GL3004, u16 reg, u16 len, u32 *val)
++{
++	struct i2c_client *client = v4l2_get_subdevdata(&GL3004->sd);
++	struct i2c_msg msgs[2];
++	u8 addr_buf[2];
++	u8 data_buf[4] = {0};
++	int ret;
++
++	if (len > 4)
++		return -EINVAL;
++
++	put_unaligned_be16(reg, addr_buf);
++	msgs[0].addr = client->addr;
++	msgs[0].flags = 0;
++	msgs[0].len = sizeof(addr_buf);
++	msgs[0].buf = addr_buf;
++	msgs[1].addr = client->addr;
++	msgs[1].flags = I2C_M_RD;
++	msgs[1].len = len;
++	msgs[1].buf = &data_buf[4 - len];
++
++	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
++	if (ret != ARRAY_SIZE(msgs))
++		return -EIO;
++
++	*val = get_unaligned_be32(data_buf);
++
++	return 0;
++}
++
++static int GL3004_write_reg(struct GL3004 *GL3004, u16 reg, u16 len, u32 val)
++{
++	struct i2c_client *client = v4l2_get_subdevdata(&GL3004->sd);
++	u8 buf[6];
++
++	if (reg == 0) {
++		msleep(val);
++		return 0;
++	}
++
++	if (len > 4)
++		return -EINVAL;
++
++	put_unaligned_be16(reg, buf);
++	put_unaligned_be32(val << 8 * (4 - len), buf + 2);
++	if (i2c_master_send(client, buf, len + 2) != len + 2)
++		return -EIO;
++
++	return 0;
++}
++
++static u64 get_pixel_rate(struct GL3004 *GL3004)
++{
++	return GL3004->cur_mode->width * GL3004->cur_mode->height * GL3004->cur_mode->fps * 16 / GL3004->cur_mode->lanes;
++}
++
++static int GL3004_set_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct GL3004 *GL3004 = container_of(ctrl->handler,
++					     struct GL3004, ctrl_handler);
++	struct i2c_client *client = v4l2_get_subdevdata(&GL3004->sd);
++	int ret = 0;
++
++	/* V4L2 controls values will be applied only when power is already up */
++	if (!pm_runtime_get_if_in_use(&client->dev))
++		return 0;
++
++	switch (ctrl->id) {
++	case V4L2_CID_ANALOGUE_GAIN:
++		dev_dbg(&client->dev, "set analogue gain.\n");
++		break;
++
++	case V4L2_CID_DIGITAL_GAIN:
++		dev_dbg(&client->dev, "set digital gain.\n");
++		break;
++
++	case V4L2_CID_EXPOSURE:
++		dev_dbg(&client->dev, "set exposure time.\n");
++		break;
++
++	case V4L2_CID_VBLANK:
++		dev_dbg(&client->dev, "set vblank.\n");
++		break;
++
++	case V4L2_CID_IPU_QUERY_SUB_STREAM:
++		dev_dbg(&client->dev, "query stream.\n");
++		break;
++
++	default:
++		dev_err(&client->dev, "unexpected ctrl id 0x%08x.\n", ctrl->id);
++		ret = -EINVAL;
++		break;
++	}
++
++	pm_runtime_put(&client->dev);
++
++	return ret;
++}
++
++static const struct v4l2_ctrl_ops GL3004_ctrl_ops = {
++	.s_ctrl = GL3004_set_ctrl,
++};
++
++static struct v4l2_ctrl_config GL3004_csi_port = {
++	.ops	= &GL3004_ctrl_ops,
++	.id		= GL3004_CID_CSI_PORT,
++	.type	= V4L2_CTRL_TYPE_INTEGER,
++	.name	= "CSI port",
++	.min	= 0,
++	.max	= 5,
++	.def	= 1,
++	.step	= 1,
++	.flags	= V4L2_CTRL_FLAG_READ_ONLY,
++};
++
++static struct v4l2_ctrl_config GL3004_i2c_bus = {
++	.ops	= &GL3004_ctrl_ops,
++	.id		= GL3004_CID_I2C_BUS,
++	.type	= V4L2_CTRL_TYPE_INTEGER,
++	.name	= "I2C bus",
++	.min	= 0,
++	.max	= MINORMASK,
++	.def	= 0,
++	.step	= 1,
++	.flags	= V4L2_CTRL_FLAG_READ_ONLY,
++};
++
++static struct v4l2_ctrl_config GL3004_i2c_id = {
++	.ops	= &GL3004_ctrl_ops,
++	.id		= GL3004_CID_I2C_ID,
++	.type	= V4L2_CTRL_TYPE_INTEGER,
++	.name	= "I2C id",
++	.min	= 0x08,
++	.max	= 0x77,
++	.def	= 0x08,
++	.step	= 1,
++	.flags	= V4L2_CTRL_FLAG_READ_ONLY,
++};
++
++static struct v4l2_ctrl_config GL3004_i2c_slave_address = {
++	.ops	= &GL3004_ctrl_ops,
++	.id		= GL3004_CID_I2C_SLAVE_ADDRESS,
++	.type	= V4L2_CTRL_TYPE_INTEGER,
++	.name	= "I2C slave address",
++	.min	= 0x0,
++	.max	= 0x7f,
++	.def	= 0x08,
++	.step	= 1,
++	.flags	= V4L2_CTRL_FLAG_READ_ONLY,
++};
++
++static struct v4l2_ctrl_config GL3004_fps = {
++	.ops	= &GL3004_ctrl_ops,
++	.id		= GL3004_CID_FPS,
++	.type	= V4L2_CTRL_TYPE_INTEGER,
++	.name	= "fps",
++	.min	= 10,
++	.max	= 120,
++	.def	= 30,
++	.step	= 1,
++	.flags	= V4L2_CTRL_FLAG_READ_ONLY,
++};
++
++static struct v4l2_ctrl_config GL3004_frame_interval = {
++	.ops	= &GL3004_ctrl_ops,
++	.id		= GL3004_CID_FRAME_INTERVAL,
++	.type	= V4L2_CTRL_TYPE_INTEGER,
++	.name	= "frame interval",
++	.min	= 0,
++	.max	= 1000,
++	.def	= 25,
++	.step	= 1,
++	.flags	= V4L2_CTRL_FLAG_READ_ONLY,
++};
++
++static struct v4l2_ctrl_config GL3004_q_sub_stream = {
++	.ops 	= &GL3004_ctrl_ops,
++	.id 	= V4L2_CID_IPU_QUERY_SUB_STREAM,
++	.name 	= "query virtual channel",
++	.type 	= V4L2_CTRL_TYPE_INTEGER_MENU,
++	.max 	= 1,
++	.min 	= 0,
++	.def 	= 0,
++	.menu_skip_mask = 0,
++	.qmenu_int = NULL,
++};
++
++static const struct v4l2_ctrl_config GL3004_s_sub_stream = {
++	.ops 	= &GL3004_ctrl_ops,
++	.id 	= V4L2_CID_IPU_SET_SUB_STREAM,
++	.name 	= "set virtual channel",
++	.type 	= V4L2_CTRL_TYPE_INTEGER64,
++	.max 	= 0xFFFF,
++	.min 	= 0,
++	.def 	= 0,
++	.step 	= 1,
++};
++
++static unsigned int mbus_code_to_mipi(u32 code)
++{
++	switch (code) {
++	case MEDIA_BUS_FMT_UYVY8_1X16:
++		return MIPI_CSI2_TYPE_YUV422_8;
++	default:
++		WARN_ON(1);
++		return -EINVAL;
++	}
++}
++
++static void set_sub_stream_fmt(s64 *sub_stream, u32 code)
++{
++       *sub_stream &= 0xFFFFFFFFFFFF0000;
++       *sub_stream |= code;
++}
++
++static void set_sub_stream_h(s64 *sub_stream, u32 height)
++{
++       s64 val = height;
++       val &= 0xFFFF;
++       *sub_stream &= 0xFFFFFFFF0000FFFF;
++       *sub_stream |= val << 16;
++}
++
++static void set_sub_stream_w(s64 *sub_stream, u32 width)
++{
++       s64 val = width;
++       val &= 0xFFFF;
++       *sub_stream &= 0xFFFF0000FFFFFFFF;
++       *sub_stream |= val << 32;
++}
++
++static void set_sub_stream_dt(s64 *sub_stream, u32 dt)
++{
++       s64 val = dt;
++       val &= 0xFF;
++       *sub_stream &= 0xFF00FFFFFFFFFFFF;
++       *sub_stream |= val << 48;
++}
++
++static void set_sub_stream_vc_id(s64 *sub_stream, u32 vc_id)
++{
++       s64 val = vc_id;
++       val &= 0xFF;
++       *sub_stream &= 0x00FFFFFFFFFFFFFF;
++       *sub_stream |= val << 56;
++}
++
++static int GL3004_init_controls(struct GL3004 *GL3004)
++{
++	struct i2c_client *client = v4l2_get_subdevdata(&GL3004->sd);
++	struct v4l2_ctrl_handler *ctrl_hdlr;
++	int ret;
++
++	ctrl_hdlr = &GL3004->ctrl_handler;
++	ret = v4l2_ctrl_handler_init(ctrl_hdlr, 8);
++	if (ret)
++		return ret;
++
++	ctrl_hdlr->lock = &GL3004->mutex;
++	GL3004->link_freq = v4l2_ctrl_new_int_menu(ctrl_hdlr, &GL3004_ctrl_ops, V4L2_CID_LINK_FREQ, ARRAY_SIZE(link_freq_menu_items) - 1, 0, link_freq_menu_items);
++	if (GL3004->link_freq)
++		GL3004->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	GL3004->vblank = v4l2_ctrl_new_std(ctrl_hdlr, &GL3004_ctrl_ops, V4L2_CID_VBLANK, 0, 1, 1, 1);
++	v4l2_ctrl_new_std(ctrl_hdlr, &GL3004_ctrl_ops, V4L2_CID_ANALOGUE_GAIN, 0, 1, 1, 1);
++	v4l2_ctrl_new_std(ctrl_hdlr, &GL3004_ctrl_ops, V4L2_CID_DIGITAL_GAIN, 0, 1, 1, 1);
++	GL3004->exposure = v4l2_ctrl_new_std(ctrl_hdlr, &GL3004_ctrl_ops, V4L2_CID_EXPOSURE, 0, 1, 1, 1);
++	GL3004_csi_port.def = GL3004->platform_data->port;
++	GL3004->csi_port = v4l2_ctrl_new_custom(ctrl_hdlr, &GL3004_csi_port, NULL);
++	GL3004_i2c_bus.def = i2c_adapter_id(client->adapter);
++	GL3004->i2c_bus = v4l2_ctrl_new_custom(ctrl_hdlr, &GL3004_i2c_bus, NULL);
++	GL3004_i2c_id.def = client->addr;
++	GL3004->i2c_id = v4l2_ctrl_new_custom(ctrl_hdlr, &GL3004_i2c_id, NULL);
++	GL3004_i2c_slave_address.def = GL3004->platform_data->i2c_slave_address;
++	GL3004->i2c_slave_address = v4l2_ctrl_new_custom(ctrl_hdlr, &GL3004_i2c_slave_address, NULL);
++	GL3004_fps.def = GL3004->cur_mode->fps;
++	GL3004->fps = v4l2_ctrl_new_custom(ctrl_hdlr, &GL3004_fps, NULL);
++	GL3004_frame_interval.def = 1000 / GL3004->cur_mode->fps;
++	GL3004->frame_interval = v4l2_ctrl_new_custom(ctrl_hdlr, &GL3004_frame_interval, NULL);
++
++	GL3004->pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &GL3004_ctrl_ops, V4L2_CID_PIXEL_RATE, get_pixel_rate(GL3004), get_pixel_rate(GL3004), 1, get_pixel_rate(GL3004));
++	if (GL3004->pixel_rate)
++		GL3004->pixel_rate->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	GL3004->hblank = v4l2_ctrl_new_std(ctrl_hdlr, &GL3004_ctrl_ops, V4L2_CID_HBLANK, 0, 1, 1, 1);
++	if (GL3004->hblank)
++		GL3004->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	GL3004_q_sub_stream.qmenu_int = &GL3004->sub_stream;
++	GL3004->query_sub_stream = v4l2_ctrl_new_custom(ctrl_hdlr, &GL3004_q_sub_stream, NULL);
++	if (ctrl_hdlr->error) {
++		dev_dbg(&client->dev, "new query sub stream ctrl, error = %d.\n",
++			ctrl_hdlr->error);
++		return ctrl_hdlr->error;
++	}
++
++	GL3004->set_sub_stream = v4l2_ctrl_new_custom(ctrl_hdlr, &GL3004_s_sub_stream, NULL);
++	if (ctrl_hdlr->error) {
++		dev_dbg(&client->dev, "new set sub stream ctrl, error = %d.\n",
++			ctrl_hdlr->error);
++		return ctrl_hdlr->error;
++	}
++
++	if (ctrl_hdlr->error)
++		return ctrl_hdlr->error;
++
++	GL3004->sd.ctrl_handler = ctrl_hdlr;
++
++	return ret;
++}
++
++static void GL3004_update_pad_format(const struct GL3004_mode *mode,
++				     struct v4l2_mbus_framefmt *fmt)
++{
++	fmt->width = mode->width;
++	fmt->height = mode->height;
++	fmt->code = mode->code;
++	fmt->field = V4L2_FIELD_NONE;
++}
++
++static int GL3004_start_streaming(struct GL3004 *GL3004)
++{
++	int ret;
++
++	GL3004->set_sub_stream->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++	ret = __v4l2_ctrl_handler_setup(GL3004->sd.ctrl_handler);
++	GL3004->set_sub_stream->flags &= ~V4L2_CTRL_FLAG_READ_ONLY;
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++static void GL3004_stop_streaming(struct GL3004 *GL3004)
++{
++	return;
++}
++
++static int GL3004_set_stream(struct v4l2_subdev *sd, int enable)
++{
++	struct GL3004 *GL3004 = to_GL3004(sd);
++	int ret = 0;
++
++	if (GL3004->streaming == enable)
++		return 0;
++
++	mutex_lock(&GL3004->mutex);
++	if (enable) {
++		dev_dbg(sd->dev, "[%s()], start streaming.\n", __func__);
++		ret = GL3004_start_streaming(GL3004);
++		if (ret) {
++			enable = 0;
++			GL3004_stop_streaming(GL3004);
++		}
++	} else {
++		dev_dbg(sd->dev, "[%s()], stop streaming.\n", __func__);
++		GL3004_stop_streaming(GL3004);
++	}
++
++	GL3004->streaming = enable;
++	mutex_unlock(&GL3004->mutex);
++
++	return ret;
++}
++
++static int GL3004_g_frame_interval(struct v4l2_subdev *sd,
++		struct v4l2_subdev_frame_interval *fival)
++{
++	struct GL3004 *GL3004 = to_GL3004(sd);
++
++	fival->pad = 0;
++	fival->interval.numerator = 1;
++	fival->interval.denominator = GL3004->cur_mode->fps;
++
++	return 0;
++}
++
++static int __maybe_unused GL3004_suspend(struct device *dev)
++{
++	struct i2c_client *client = to_i2c_client(dev);
++	struct v4l2_subdev *sd = i2c_get_clientdata(client);
++	struct GL3004 *GL3004 = to_GL3004(sd);
++
++	mutex_lock(&GL3004->mutex);
++	if (GL3004->streaming)
++		GL3004_stop_streaming(GL3004);
++
++	mutex_unlock(&GL3004->mutex);
++
++	return 0;
++}
++
++static int __maybe_unused GL3004_resume(struct device *dev)
++{
++	struct i2c_client *client = to_i2c_client(dev);
++	struct v4l2_subdev *sd = i2c_get_clientdata(client);
++	struct GL3004 *GL3004 = to_GL3004(sd);
++	int ret;
++
++	mutex_lock(&GL3004->mutex);
++	if (GL3004->streaming) {
++		ret = GL3004_start_streaming(GL3004);
++		if (ret) {
++			GL3004->streaming = false;
++			GL3004_stop_streaming(GL3004);
++			mutex_unlock(&GL3004->mutex);
++			return ret;
++		}
++	}
++
++	mutex_unlock(&GL3004->mutex);
++
++	return 0;
++}
++
++static int GL3004_set_format(struct v4l2_subdev *sd,
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
++			     struct v4l2_subdev_pad_config *cfg,
++#else
++			     struct v4l2_subdev_state *sd_state,
++#endif
++			     struct v4l2_subdev_format *fmt)
++{
++	struct GL3004 *GL3004 = to_GL3004(sd);
++	struct i2c_client *client = v4l2_get_subdevdata(&GL3004->sd);
++	const struct GL3004_mode *mode;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(supported_modes); i++) {
++		if (supported_modes[i].width != fmt->format.width
++			|| supported_modes[i].height != fmt->format.height) {
++			dev_dbg(&client->dev, "resolution doesn't match\n");
++			continue;
++		}
++		if (supported_modes[i].code != fmt->format.code) {
++			dev_dbg(&client->dev, "pixel format doesn't match\n");
++			continue;
++		}
++		mode = &supported_modes[i];
++		break;
++	}
++
++	if (i >= ARRAY_SIZE(supported_modes))
++		mode = &supported_modes[0];
++
++	mutex_lock(&GL3004->mutex);
++	GL3004_update_pad_format(mode, &fmt->format);
++	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
++		*v4l2_subdev_get_try_format(sd, cfg, fmt->pad) = fmt->format;
++#else
++		*v4l2_subdev_get_try_format(sd, sd_state, fmt->pad) = fmt->format;
++#endif
++	} else {
++		GL3004->cur_mode = mode;
++		set_sub_stream_fmt(&GL3004->sub_stream, mode->code);
++		set_sub_stream_h(&GL3004->sub_stream, mode->height);
++		set_sub_stream_w(&GL3004->sub_stream, mode->width);
++		set_sub_stream_dt(&GL3004->sub_stream, mbus_code_to_mipi(mode->code));
++		set_sub_stream_vc_id(&GL3004->sub_stream, 0);
++	}
++
++	mutex_unlock(&GL3004->mutex);
++
++	return 0;
++}
++
++static int GL3004_get_format(struct v4l2_subdev *sd,
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
++			     struct v4l2_subdev_pad_config *cfg,
++#else
++			     struct v4l2_subdev_state *sd_state,
++#endif
++			     struct v4l2_subdev_format *fmt)
++{
++	struct GL3004 *GL3004 = to_GL3004(sd);
++
++	mutex_lock(&GL3004->mutex);
++	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
++		fmt->format = *v4l2_subdev_get_try_format(&GL3004->sd, cfg,
++							  fmt->pad);
++#else
++		fmt->format = *v4l2_subdev_get_try_format(&GL3004->sd,
++							  sd_state, fmt->pad);
++#endif
++	else
++		GL3004_update_pad_format(GL3004->cur_mode, &fmt->format);
++
++	mutex_unlock(&GL3004->mutex);
++
++	return 0;
++}
++
++static int GL3004_enum_mbus_code(struct v4l2_subdev *sd,
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
++				 struct v4l2_subdev_pad_config *cfg,
++#else
++				 struct v4l2_subdev_state *sd_state,
++#endif
++				 struct v4l2_subdev_mbus_code_enum *code)
++{
++	if (code->index >= ARRAY_SIZE(supported_formats))
++		return -EINVAL;
++
++	code->code = supported_formats[code->index];
++
++	return 0;
++}
++
++static int GL3004_enum_frame_size(struct v4l2_subdev *sd,
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
++				  struct v4l2_subdev_pad_config *cfg,
++#else
++				  struct v4l2_subdev_state *sd_state,
++#endif
++				  struct v4l2_subdev_frame_size_enum *fse)
++{
++	if (fse->index >= ARRAY_SIZE(supported_modes))
++		return -EINVAL;
++
++	fse->min_width = supported_modes[fse->index].width;
++	fse->max_width = fse->min_width;
++	fse->min_height = supported_modes[fse->index].height;
++	fse->max_height = fse->min_height;
++
++	return 0;
++}
++
++static int GL3004_enum_frame_interval(struct v4l2_subdev *subdev,
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
++		struct v4l2_subdev_pad_config *cfg,
++#else
++		struct v4l2_subdev_state *sd_state,
++#endif
++		struct v4l2_subdev_frame_interval_enum *fie)
++{
++	struct GL3004 *GL3004 = to_GL3004(subdev);
++
++	fie->interval.numerator = 1;
++	fie->interval.denominator = GL3004->cur_mode->fps;
++
++	return 0;
++}
++
++static int GL3004_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
++{
++	struct GL3004 *GL3004 = to_GL3004(sd);
++
++	mutex_lock(&GL3004->mutex);
++	GL3004_update_pad_format(&supported_modes[0],
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
++				 v4l2_subdev_get_try_format(sd, fh->pad, 0));
++#else
++				 v4l2_subdev_get_try_format(sd, fh->state, 0));
++#endif
++	mutex_unlock(&GL3004->mutex);
++
++	return 0;
++}
++
++static const struct v4l2_subdev_video_ops GL3004_video_ops = {
++	.s_stream = GL3004_set_stream,
++	.g_frame_interval = GL3004_g_frame_interval,
++};
++
++static const struct v4l2_subdev_pad_ops GL3004_pad_ops = {
++	.set_fmt = GL3004_set_format,
++	.get_fmt = GL3004_get_format,
++	.enum_mbus_code = GL3004_enum_mbus_code,
++	.enum_frame_size = GL3004_enum_frame_size,
++	.enum_frame_interval = GL3004_enum_frame_interval,
++};
++
++static const struct v4l2_subdev_ops GL3004_subdev_ops = {
++	.video = &GL3004_video_ops,
++	.pad = &GL3004_pad_ops,
++};
++
++static const struct media_entity_operations GL3004_subdev_entity_ops = {
++	.link_validate = v4l2_subdev_link_validate,
++};
++
++static const struct v4l2_subdev_internal_ops GL3004_internal_ops = {
++	.open = GL3004_open,
++};
++
++static int GL3004_identify_module(struct GL3004 *GL3004)
++{
++	struct i2c_client *client = v4l2_get_subdevdata(&GL3004->sd);
++	int ret;
++	u32 val;
++
++	ret = GL3004_read_reg(GL3004, GL3004_REG_CHIP_ID,
++			      GL3004_REG_VALUE_16BIT, &val);
++	if (ret)
++		return ret;
++
++	if (val != GL3004_CHIP_ID) {
++		dev_err(&client->dev, "chip id mismatch: %x!=%x",
++			GL3004_CHIP_ID, val);
++		return -ENXIO;
++	}
++
++	return 0;
++}
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
++static int GL3004_remove(struct i2c_client *client)
++#else
++static void GL3004_remove(struct i2c_client *client)
++#endif
++{
++	struct v4l2_subdev *sd = i2c_get_clientdata(client);
++	struct GL3004 *GL3004 = to_GL3004(sd);
++
++	v4l2_async_unregister_subdev(sd);
++	media_entity_cleanup(&sd->entity);
++	v4l2_ctrl_handler_free(sd->ctrl_handler);
++	pm_runtime_disable(&client->dev);
++	mutex_destroy(&GL3004->mutex);
++
++	#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
++		return 0;
++	#else
++		return;
++	#endif
++
++}
++
++irqreturn_t GL3004_threaded_irq_fn(int irq, void *dev_id)
++{
++	struct GL3004 *GL3004 = dev_id;
++
++	if ((GL3004->platform_data->gpios[0] != -1) && (GL3004->platform_data->irq_pin != -1)) {
++		mutex_lock(&GL3004->mutex);
++		if (GL3004->streaming == false) {
++			gpio_set_value(GL3004->platform_data->gpios[0], 0);
++			goto GL3004_irq_handled;
++		}
++
++		if (GL3004->strobe_source->val == V4L2_FLASH_STROBE_SOURCE_EXTERNAL) {
++			gpio_set_value(GL3004->platform_data->gpios[0],
++					gpio_get_value(GL3004->platform_data->irq_pin));
++		}
++
++GL3004_irq_handled:
++		mutex_unlock(&GL3004->mutex);
++	}
++
++	return IRQ_HANDLED;
++}
++
++static int GL3004_probe(struct i2c_client *client)
++{
++	struct GL3004 *GL3004;
++	int ret;
++
++	GL3004 = devm_kzalloc(&client->dev, sizeof(*GL3004), GFP_KERNEL);
++	if (!GL3004)
++		return -ENOMEM;
++
++	GL3004->platform_data = client->dev.platform_data;
++	if (GL3004->platform_data == NULL) {
++		dev_err(&client->dev, "no platform data provided\n");
++		return -EINVAL;
++	}
++	v4l2_i2c_subdev_init(&GL3004->sd, client, &GL3004_subdev_ops);
++
++	ret = GL3004_identify_module(GL3004);
++	if (ret) {
++		dev_err(&client->dev, "failed to find sensor: %d", ret);
++		return ret;
++	}
++
++	if (GL3004->platform_data->suffix)
++		snprintf(GL3004->sd.name,
++				sizeof(GL3004->sd.name), "EV2M-GOM1 %c",
++				GL3004->platform_data->suffix);
++
++	mutex_init(&GL3004->mutex);
++	GL3004->cur_mode = &supported_modes[0];
++	ret = GL3004_init_controls(GL3004);
++	if (ret) {
++		dev_err(&client->dev, "failed to init controls: %d", ret);
++		goto probe_error_v4l2_ctrl_handler_free;
++	}
++
++	GL3004->sd.internal_ops = &GL3004_internal_ops;
++	GL3004->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
++	GL3004->sd.entity.ops = &GL3004_subdev_entity_ops;
++	GL3004->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
++	GL3004->pad.flags = MEDIA_PAD_FL_SOURCE;
++	ret = media_entity_pads_init(&GL3004->sd.entity, 1, &GL3004->pad);
++	if (ret) {
++		dev_err(&client->dev, "failed to init entity pads: %d", ret);
++		goto probe_error_v4l2_ctrl_handler_free;
++	}
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
++	ret = v4l2_async_register_subdev_sensor_common(&GL3004->sd);
++#else
++	ret = v4l2_async_register_subdev_sensor(&GL3004->sd);
++#endif
++	if (ret < 0) {
++		dev_err(&client->dev, "failed to register V4L2 subdev: %d",
++			ret);
++		goto probe_error_media_entity_cleanup;
++	}
++
++	/*
++	 * Device is already turned on by i2c-core with ACPI domain PM.
++	 * Enable runtime PM and turn off the device.
++	 */
++	pm_runtime_set_active(&client->dev);
++	pm_runtime_enable(&client->dev);
++	pm_runtime_idle(&client->dev);
++
++	return 0;
++
++probe_error_media_entity_cleanup:
++	media_entity_cleanup(&GL3004->sd.entity);
++
++probe_error_v4l2_ctrl_handler_free:
++	v4l2_ctrl_handler_free(GL3004->sd.ctrl_handler);
++	mutex_destroy(&GL3004->mutex);
++
++	return ret;
++}
++
++static const struct dev_pm_ops GL3004_pm_ops = {
++	SET_SYSTEM_SLEEP_PM_OPS(GL3004_suspend, GL3004_resume)
++};
++
++static const struct i2c_device_id GL3004_id_table[] = {
++	{ "ev2m_gom1", 0 },
++	{ /* sentinel */ },
++};
++MODULE_DEVICE_TABLE(i2c, GL3004_id_table);
++
++static struct i2c_driver GL3004_i2c_driver = {
++	.driver = {
++		.name = "ev2m_gom1",
++		.pm = &GL3004_pm_ops,
++	},
++	.probe_new = GL3004_probe,
++	.remove = GL3004_remove,
++	.id_table = GL3004_id_table,
++};
++
++module_i2c_driver(GL3004_i2c_driver);
++
++MODULE_AUTHOR("Yi-Chen, Liu <yichen_liu@innodisk.com>");
++MODULE_DESCRIPTION("innodisk EV2M-GOM1 V4L2 driver");
++MODULE_LICENSE("GPL v2");
+Index: linux-kernel-v6.2/include/media/ev2m_gom1.h
+===================================================================
+--- /dev/null
++++ linux-kernel-v6.2/include/media/ev2m_gom1.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (C) 2014 - 2022 Intel Corporation */
++
++#ifndef __EV2M_GOM1_H
++#define __EV2M_GOM1_H
++
++#include <linux/types.h>
++
++#define EV2MGOM1_NAME		"ev2m_gom1"
++
++struct ev2m_gom1_platform_data {
++	unsigned int port;
++	unsigned int lanes;
++	uint32_t i2c_slave_address;
++	int irq_pin;
++	unsigned int irq_pin_flags;
++	char irq_pin_name[16];
++	int reset_pin;
++	int detect_pin;
++	char suffix;
++	int gpios[4];
++};
++
++#endif /* __EV2M_GOM1_H  */
