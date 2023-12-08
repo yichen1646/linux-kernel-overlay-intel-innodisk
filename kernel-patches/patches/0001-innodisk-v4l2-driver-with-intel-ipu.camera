@@ -32,7 +32,7 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 ===================================================================
 --- /dev/null
 +++ linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
-@@ -0,0 +1,887 @@
+@@ -0,0 +1,894 @@
 +// SPDX-License-Identifier: GPL-2.0
 +// Copyright (c) 2022 Intel Corporation.
 +
@@ -917,9 +917,16 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +
 +module_i2c_driver(GL3004_i2c_driver);
 +
++MODULE_LICENSE("GPL");
 +MODULE_AUTHOR("Yi-Chen, Liu <yichen_liu@innodisk.com>");
-+MODULE_DESCRIPTION("innodisk EV2M-GOM1 V4L2 driver");
-+MODULE_LICENSE("GPL v2");
++MODULE_DESCRIPTION("Innodisk EV2M-GOM1 V4L2 driver");
++MODULE_ALIAS("Innodisk EV2M-GOM1");
++MODULE_VERSION("v1.0");
++
++/*
++ *	v1.0: first steady version
++ *
++ */
 Index: linux-kernel-v6.2/include/media/ev2m_gom1.h
 ===================================================================
 --- /dev/null
