@@ -2,7 +2,7 @@ Index: linux-kernel-v6.2/drivers/media/i2c/Kconfig
 ===================================================================
 --- linux-kernel-v6.2.orig/drivers/media/i2c/Kconfig
 +++ linux-kernel-v6.2/drivers/media/i2c/Kconfig
-@@ -1644,6 +1644,16 @@ config VIDEO_LT6911UXC
+@@ -1644,6 +1644,25 @@ config VIDEO_LT6911UXC
  
  	To compile this driver as a module, choose M here: the
  	module will be called lt6911uxc.
@@ -16,6 +16,15 @@ Index: linux-kernel-v6.2/drivers/media/i2c/Kconfig
 +	To compile this driver as a module, choose M here: the
 +	module will be called ev2m_gom1.
 +
++config VIDEO_EV2M_OOM1
++	tristate "Innodisk EV2M_OOM1 module driver"
++	depends on I2C && VIDEO_V4L2_SUBDEV_API
++	help
++	This is a Video4Linux2 driver for the Innodisk EV2M_OOM1 camera module.
++
++	To compile this driver as a module, choose M here: the
++	module will be called ev2m_oom1.
++
  endmenu
  
  endif # VIDEO_DEV
@@ -23,16 +32,17 @@ Index: linux-kernel-v6.2/drivers/media/i2c/Makefile
 ===================================================================
 --- linux-kernel-v6.2.orig/drivers/media/i2c/Makefile
 +++ linux-kernel-v6.2/drivers/media/i2c/Makefile
-@@ -146,3 +146,4 @@ obj-$(CONFIG_VIDEO_VS6624) += vs6624.o
+@@ -146,3 +146,5 @@ obj-$(CONFIG_VIDEO_VS6624) += vs6624.o
  obj-$(CONFIG_VIDEO_WM8739) += wm8739.o
  obj-$(CONFIG_VIDEO_WM8775) += wm8775.o
  obj-$(CONFIG_VIDEO_LT6911UXC) += lt6911uxc.o
 +obj-$(CONFIG_VIDEO_EV2M_GOM1) += ev2m_gom1.o
++obj-$(CONFIG_VIDEO_EV2M_OOM1) += ev2m_oom1.o
 Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 ===================================================================
 --- /dev/null
 +++ linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
-@@ -0,0 +1,894 @@
+@@ -0,0 +1,896 @@
 +// SPDX-License-Identifier: GPL-2.0
 +// Copyright (c) 2022 Intel Corporation.
 +
@@ -489,6 +499,7 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +{
 +	int ret;
 +
++	dev_info (GL3004->sd.dev, "GL3004_start_streaming\n");
 +	GL3004->set_sub_stream->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 +	ret = __v4l2_ctrl_handler_setup(GL3004->sd.ctrl_handler);
 +	GL3004->set_sub_stream->flags &= ~V4L2_CTRL_FLAG_READ_ONLY;
@@ -511,6 +522,7 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +	if (GL3004->streaming == enable)
 +		return 0;
 +
++	dev_info (sd->dev, "GL3004_set_stream\n");
 +	mutex_lock(&GL3004->mutex);
 +	if (enable) {
 +		dev_dbg(sd->dev, "[%s()], start streaming.\n", __func__);
@@ -956,3 +968,1312 @@ Index: linux-kernel-v6.2/include/media/ev2m_gom1.h
 +};
 +
 +#endif /* __EV2M_GOM1_H  */
+Index: linux-kernel-v6.2/include/media/ev2m_oom1.h
+===================================================================
+--- /dev/null
++++ linux-kernel-v6.2/include/media/ev2m_oom1.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (C) 2014 - 2022 Intel Corporation */
++
++#ifndef __EV2M_OOM1_H
++#define __EV2M_OOM1_H
++
++#include <linux/types.h>
++
++#define EV2MOOM1_NAME		"ev2m_oom1"
++
++struct ev2m_oom1_platform_data {
++	unsigned int port;
++	unsigned int lanes;
++	uint32_t i2c_slave_address;
++	int irq_pin;
++	unsigned int irq_pin_flags;
++	char irq_pin_name[16];
++	int reset_pin;
++	int detect_pin;
++	char suffix;
++	int gpios[4];
++};
++
++#endif /* __EV2M_OOM1_H  */
+Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_oom1.c
+===================================================================
+--- /dev/null
++++ linux-kernel-v6.2/drivers/media/i2c/ev2m_oom1.c
+@@ -0,0 +1,1275 @@
++// SPDX-License-Identifier: GPL-2.0
++// Copyright (c) 2022 Intel Corporation.
++
++#include <asm/unaligned.h>
++#include <linux/acpi.h>
++#include <linux/delay.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/pm_runtime.h>
++#include <linux/gpio.h>
++#include <linux/regmap.h>
++#include <linux/firmware.h>
++#include <linux/version.h>
++#include <linux/interrupt.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-fwnode.h>
++#include <media/ev2m_oom1.h>
++#include <linux/version.h>
++
++#include <linux/ipu-isys.h>
++
++#define AP1302_REG_VALUE_08BIT			1
++#define AP1302_REG_VALUE_16BIT			2
++
++#define AP1302_REG_CHIP_ID				0x0000
++#define AP1302_CHIP_ID					0x0265
++
++#define AP1302_LINK_FREQ_62_208MHZ		62208000ULL
++
++#define AP1302_CID_CSI_PORT         	(V4L2_CID_USER_BASE | 0x1001)
++#define AP1302_CID_I2C_BUS         		(V4L2_CID_USER_BASE | 0x1002)
++#define AP1302_CID_I2C_ID         		(V4L2_CID_USER_BASE | 0x1003)
++#define AP1302_CID_I2C_SLAVE_ADDRESS	(V4L2_CID_USER_BASE | 0x1004)
++#define AP1302_CID_FPS         			(V4L2_CID_USER_BASE | 0x1005)
++#define AP1302_CID_FRAME_INTERVAL		(V4L2_CID_USER_BASE | 0x1006)
++
++#define to_AP1302(_sd)					container_of(_sd, struct AP1302, sd)
++
++#define MIPI_CSI2_TYPE_YUV422_8			0x1e
++
++/* AP1302 ISP register address */
++#define AP1302_SIP_CRC					0xF052
++#define AP1302_FIRMWARE_WINDOW_OFFSET	0x8000
++#define AP1302_FIRMWARE_WINDOW_SIZE		0x2000
++#define AP1302_BOOTDATA_STAGE			0x6002
++#define AP1302_FIRMWARE_BUFFER			0x0FF0
++#define PREVIEW_HINF_CTRL_ADDR			0x2030
++#define PREVIEW_OUT_FMT_ADDR			0x2012
++#define PREVIEW_MIPI_CTRL_ADDR			0x2016
++#define PREVIEW_MAX_FPS_ADDR			0x2020
++
++/* PCA9536 register addresses */
++#define PCA9536_OUTPUT                      0x01
++#define PCA9536_CONFIG                      0x03
++
++/* PCA9536 output GPIOs */
++#define PCA9536_PWR_EN                      BIT(0)
++#define PCA9536_RST                         BIT(2)
++#define PCA9536_STANDBY_N                   BIT(3)
++
++#define AP1302_FIRMWARE_FILENAME		"AP1302_AR0234_Innodisk.bin"
++
++struct AP1302_mode {
++	/* Frame width in pixels */
++	u32 width;
++
++	/* Frame height in pixels */
++	u32 height;
++
++	/* Horizontal timining size */
++	u32 hts;
++
++	/* Default vertical timining size */
++	u32 vts_def;
++
++	/* Min vertical timining size */
++	u32 vts_min;
++
++	/* Link frequency needed for this resolution */
++	u32 link_freq_index;
++
++	/* MEDIA_BUS_FMT */
++	u32 code;
++
++	/* MIPI_LANES */
++	s32 lanes;
++
++	/* MODE_FPS*/
++	u32 fps;
++
++	/* bit per pixel */
++	u32 bpp;
++};
++
++static const s64 link_freq_menu_items[] = {
++	AP1302_LINK_FREQ_62_208MHZ,
++};
++
++static const struct AP1302_mode supported_modes[] = {
++	{
++		.width 			 = 1920,
++		.height 		 = 1200,
++		.code			 = MEDIA_BUS_FMT_UYVY8_1X16,
++		.lanes 	 		 = 2,
++		.fps 	 		 = 30,
++		.bpp 			 = 16,
++	},
++};
++
++static u32 supported_formats[] = {
++	MEDIA_BUS_FMT_UYVY8_1X16
++};
++
++struct PCA9536 {
++	struct i2c_client *i2c_client;
++	struct i2c_adapter *adapter;
++	struct regmap *regmap;
++};
++
++struct AP1302_firmware {
++	u32 magic;
++	u32 version;
++	char desc [256];
++	u16 pll_init_size;
++	u16 crc;
++} __packed;
++
++struct AP1302 {
++	struct v4l2_subdev sd;
++	struct media_pad pad;
++	struct v4l2_ctrl_handler ctrl_handler;
++	struct regmap *regmap;
++
++	/* V4L2 Controls */
++	struct v4l2_ctrl *link_freq;
++	struct v4l2_ctrl *vblank;
++	struct v4l2_ctrl *exposure;
++	struct v4l2_ctrl *analogue_gain;
++	struct v4l2_ctrl *digital_gain;
++	struct v4l2_ctrl *strobe_source;
++	struct v4l2_ctrl *strobe;
++	struct v4l2_ctrl *strobe_stop;
++	struct v4l2_ctrl *timeout;
++	struct v4l2_ctrl *csi_port;
++	struct v4l2_ctrl *i2c_bus;
++	struct v4l2_ctrl *i2c_id;
++	struct v4l2_ctrl *i2c_slave_address;
++	struct v4l2_ctrl *fps;
++	struct v4l2_ctrl *frame_interval;
++	struct v4l2_ctrl *pixel_rate;
++	struct v4l2_ctrl *hblank;
++	struct v4l2_ctrl *vflip;
++	struct v4l2_ctrl *hflip;
++	struct v4l2_ctrl *query_sub_stream;
++	struct v4l2_ctrl *set_sub_stream;
++
++	/* Current mode */
++	const struct AP1302_mode *cur_mode;
++
++	/* To serialize asynchronus callbacks */
++	struct mutex mutex;
++
++	/* Streaming on/off */
++	bool streaming;
++
++	struct ev2m_oom1_platform_data *platform_data;
++
++	s64 sub_stream;
++
++	/* PCA9536 */
++	struct PCA9536 pca9536;
++	struct clk *xclk;
++	const struct firmware *firmware;
++};
++
++static const struct regmap_config sensor_regmap_config = {
++	.reg_bits = 16,
++	.val_bits = 16,
++};
++
++static inline void msleep_range(unsigned int delay_base)
++{
++	usleep_range(delay_base * 1000, delay_base * 1000 + 500);
++}
++
++
++static int AP1302_read_reg(struct AP1302 *AP1302, u16 reg, u16 len, u32 *val)
++{
++	struct i2c_client *client = v4l2_get_subdevdata(&AP1302->sd);
++	struct i2c_msg msgs[2];
++	u8 addr_buf[2];
++	u8 data_buf[4] = {0};
++	int ret;
++
++	if (len > 4)
++		return -EINVAL;
++
++	put_unaligned_be16(reg, addr_buf);
++	msgs[0].addr = client->addr;
++	msgs[0].flags = 0;
++	msgs[0].len = sizeof(addr_buf);
++	msgs[0].buf = addr_buf;
++	msgs[1].addr = client->addr;
++	msgs[1].flags = I2C_M_RD;
++	msgs[1].len = len;
++	msgs[1].buf = &data_buf[4 - len];
++
++	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
++	if (ret != ARRAY_SIZE(msgs))
++		return -EIO;
++
++	*val = get_unaligned_be32(data_buf);
++
++	return 0;
++}
++
++static int PCA9536_write_reg (struct AP1302 *AP1302, u8 addr, u8 val)
++{
++	int ret = 0;
++	ret = regmap_write (AP1302->pca9536.regmap, addr, val);
++	if (ret)
++		dev_err (AP1302->sd.dev, "pca9536 i2c write failed 0x%X = %X", addr, val);
++
++	return ret;
++}
++
++static int AP1302_write_reg(struct AP1302 *AP1302, u16 reg, u16 len, u32 val)
++{
++	struct i2c_client *client = v4l2_get_subdevdata(&AP1302->sd);
++	u8 buf[6];
++
++	if (reg == 0) {
++		msleep(val);
++		return 0;
++	}
++
++	if (len > 4)
++		return -EINVAL;
++
++	put_unaligned_be16(reg, buf);
++	put_unaligned_be32(val << 8 * (4 - len), buf + 2);
++	if (i2c_master_send(client, buf, len + 2) != len + 2)
++		return -EIO;
++
++	return 0;
++}
++
++// static int AP1302_write_table (struct AP1302 *AP1302, const struct reg_8 table [])
++// {
++// 	return 0;
++// }
++
++static u64 get_pixel_rate(struct AP1302 *AP1302)
++{
++	return AP1302->cur_mode->width * AP1302->cur_mode->height * AP1302->cur_mode->fps * 16 / AP1302->cur_mode->lanes;
++}
++
++static int AP1302_set_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct AP1302 *AP1302 = container_of(ctrl->handler,
++					     struct AP1302, ctrl_handler);
++	struct i2c_client *client = v4l2_get_subdevdata(&AP1302->sd);
++	int ret = 0;
++
++	/* V4L2 controls values will be applied only when power is already up */
++	if (!pm_runtime_get_if_in_use(&client->dev))
++		return 0;
++
++	switch (ctrl->id) {
++	case V4L2_CID_ANALOGUE_GAIN:
++		dev_dbg(&client->dev, "set analogue gain.\n");
++		break;
++
++	case V4L2_CID_DIGITAL_GAIN:
++		dev_dbg(&client->dev, "set digital gain.\n");
++		break;
++
++	case V4L2_CID_EXPOSURE:
++		dev_dbg(&client->dev, "set exposure time.\n");
++		break;
++
++	case V4L2_CID_VBLANK:
++		dev_dbg(&client->dev, "set vblank.\n");
++		break;
++
++	case V4L2_CID_IPU_QUERY_SUB_STREAM:
++		dev_dbg(&client->dev, "query stream.\n");
++		break;
++
++	default:
++		dev_err(&client->dev, "unexpected ctrl id 0x%08x.\n", ctrl->id);
++		ret = -EINVAL;
++		break;
++	}
++
++	pm_runtime_put(&client->dev);
++
++	return ret;
++}
++
++static const struct v4l2_ctrl_ops AP1302_ctrl_ops = {
++	.s_ctrl = AP1302_set_ctrl,
++};
++
++static struct v4l2_ctrl_config AP1302_csi_port = {
++	.ops	= &AP1302_ctrl_ops,
++	.id		= AP1302_CID_CSI_PORT,
++	.type	= V4L2_CTRL_TYPE_INTEGER,
++	.name	= "CSI port",
++	.min	= 0,
++	.max	= 5,
++	.def	= 1,
++	.step	= 1,
++	.flags	= V4L2_CTRL_FLAG_READ_ONLY,
++};
++
++static struct v4l2_ctrl_config AP1302_i2c_bus = {
++	.ops	= &AP1302_ctrl_ops,
++	.id		= AP1302_CID_I2C_BUS,
++	.type	= V4L2_CTRL_TYPE_INTEGER,
++	.name	= "I2C bus",
++	.min	= 0,
++	.max	= MINORMASK,
++	.def	= 0,
++	.step	= 1,
++	.flags	= V4L2_CTRL_FLAG_READ_ONLY,
++};
++
++static struct v4l2_ctrl_config AP1302_i2c_id = {
++	.ops	= &AP1302_ctrl_ops,
++	.id		= AP1302_CID_I2C_ID,
++	.type	= V4L2_CTRL_TYPE_INTEGER,
++	.name	= "I2C id",
++	.min	= 0x3D,
++	.max	= 0x77,
++	.def	= 0x3D,
++	.step	= 1,
++	.flags	= V4L2_CTRL_FLAG_READ_ONLY,
++};
++
++static struct v4l2_ctrl_config AP1302_i2c_slave_address = {
++	.ops	= &AP1302_ctrl_ops,
++	.id		= AP1302_CID_I2C_SLAVE_ADDRESS,
++	.type	= V4L2_CTRL_TYPE_INTEGER,
++	.name	= "I2C slave address",
++	.min	= 0x0,
++	.max	= 0x7f,
++	.def	= 0x3D,
++	.step	= 1,
++	.flags	= V4L2_CTRL_FLAG_READ_ONLY,
++};
++
++static struct v4l2_ctrl_config AP1302_fps = {
++	.ops	= &AP1302_ctrl_ops,
++	.id		= AP1302_CID_FPS,
++	.type	= V4L2_CTRL_TYPE_INTEGER,
++	.name	= "fps",
++	.min	= 1,
++	.max	= 120,
++	.def	= 30,
++	.step	= 1,
++	.flags	= V4L2_CTRL_FLAG_READ_ONLY,
++};
++
++static struct v4l2_ctrl_config AP1302_frame_interval = {
++	.ops	= &AP1302_ctrl_ops,
++	.id		= AP1302_CID_FRAME_INTERVAL,
++	.type	= V4L2_CTRL_TYPE_INTEGER,
++	.name	= "frame interval",
++	.min	= 0,
++	.max	= 1000,
++	.def	= 25,
++	.step	= 1,
++	.flags	= V4L2_CTRL_FLAG_READ_ONLY,
++};
++
++static struct v4l2_ctrl_config AP1302_q_sub_stream = {
++	.ops 	= &AP1302_ctrl_ops,
++	.id 	= V4L2_CID_IPU_QUERY_SUB_STREAM,
++	.name 	= "query virtual channel",
++	.type 	= V4L2_CTRL_TYPE_INTEGER_MENU,
++	.max 	= 1,
++	.min 	= 0,
++	.def 	= 0,
++	.menu_skip_mask = 0,
++	.qmenu_int = NULL,
++};
++
++static const struct v4l2_ctrl_config AP1302_s_sub_stream = {
++	.ops 	= &AP1302_ctrl_ops,
++	.id 	= V4L2_CID_IPU_SET_SUB_STREAM,
++	.name 	= "set virtual channel",
++	.type 	= V4L2_CTRL_TYPE_INTEGER64,
++	.max 	= 0xFFFF,
++	.min 	= 0,
++	.def 	= 0,
++	.step 	= 1,
++};
++
++static unsigned int mbus_code_to_mipi(u32 code)
++{
++	switch (code) {
++	//case MEDIA_BUS_FMT_YUYV8_1X16:
++	case MEDIA_BUS_FMT_UYVY8_1X16:
++		return MIPI_CSI2_TYPE_YUV422_8;
++	default:
++		WARN_ON(1);
++		return -EINVAL;
++	}
++}
++
++static void set_sub_stream_fmt(s64 *sub_stream, u32 code)
++{
++       *sub_stream &= 0xFFFFFFFFFFFF0000;
++       *sub_stream |= code;
++}
++
++static void set_sub_stream_h(s64 *sub_stream, u32 height)
++{
++       s64 val = height;
++       val &= 0xFFFF;
++       *sub_stream &= 0xFFFFFFFF0000FFFF;
++       *sub_stream |= val << 16;
++}
++
++static void set_sub_stream_w(s64 *sub_stream, u32 width)
++{
++       s64 val = width;
++       val &= 0xFFFF;
++       *sub_stream &= 0xFFFF0000FFFFFFFF;
++       *sub_stream |= val << 32;
++}
++
++static void set_sub_stream_dt(s64 *sub_stream, u32 dt)
++{
++       s64 val = dt;
++       val &= 0xFF;
++       *sub_stream &= 0xFF00FFFFFFFFFFFF;
++       *sub_stream |= val << 48;
++}
++
++static void set_sub_stream_vc_id(s64 *sub_stream, u32 vc_id)
++{
++       s64 val = vc_id;
++       val &= 0xFF;
++       *sub_stream &= 0x00FFFFFFFFFFFFFF;
++       *sub_stream |= val << 56;
++}
++
++static int AP1302_init_controls(struct AP1302 *AP1302)
++{
++	struct i2c_client *client = v4l2_get_subdevdata(&AP1302->sd);
++	struct v4l2_ctrl_handler *ctrl_hdlr;
++	int ret;
++
++	AP1302->regmap = devm_regmap_init_i2c (client, &sensor_regmap_config);
++	if (IS_ERR(AP1302->regmap)) {
++		dev_err(&client->dev, "error init sensor regmap 16 : %ld\n", PTR_ERR(AP1302->regmap));
++		return -ENODEV;
++	}
++
++	ctrl_hdlr = &AP1302->ctrl_handler;
++	ret = v4l2_ctrl_handler_init(ctrl_hdlr, 8);
++	if (ret)
++		return ret;
++
++	ctrl_hdlr->lock = &AP1302->mutex;
++	AP1302->link_freq = v4l2_ctrl_new_int_menu(ctrl_hdlr, &AP1302_ctrl_ops, V4L2_CID_LINK_FREQ, ARRAY_SIZE(link_freq_menu_items) - 1, 0, link_freq_menu_items);
++	if (AP1302->link_freq)
++		AP1302->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	AP1302->vblank = v4l2_ctrl_new_std(ctrl_hdlr, &AP1302_ctrl_ops, V4L2_CID_VBLANK, 0, 1, 1, 1);
++	v4l2_ctrl_new_std(ctrl_hdlr, &AP1302_ctrl_ops, V4L2_CID_ANALOGUE_GAIN, 0, 1, 1, 1);
++	v4l2_ctrl_new_std(ctrl_hdlr, &AP1302_ctrl_ops, V4L2_CID_DIGITAL_GAIN, 0, 1, 1, 1);
++	AP1302->exposure = v4l2_ctrl_new_std(ctrl_hdlr, &AP1302_ctrl_ops, V4L2_CID_EXPOSURE, 0, 1, 1, 1);
++	AP1302_csi_port.def = AP1302->platform_data->port;
++	AP1302->csi_port = v4l2_ctrl_new_custom(ctrl_hdlr, &AP1302_csi_port, NULL);
++	AP1302_i2c_bus.def = i2c_adapter_id(client->adapter);
++	AP1302->i2c_bus = v4l2_ctrl_new_custom(ctrl_hdlr, &AP1302_i2c_bus, NULL);
++	AP1302_i2c_id.def = client->addr;
++	AP1302->i2c_id = v4l2_ctrl_new_custom(ctrl_hdlr, &AP1302_i2c_id, NULL);
++	AP1302_i2c_slave_address.def = AP1302->platform_data->i2c_slave_address;
++	AP1302->i2c_slave_address = v4l2_ctrl_new_custom(ctrl_hdlr, &AP1302_i2c_slave_address, NULL);
++	AP1302_fps.def = AP1302->cur_mode->fps;
++	AP1302->fps = v4l2_ctrl_new_custom(ctrl_hdlr, &AP1302_fps, NULL);
++	AP1302_frame_interval.def = 1000 / AP1302->cur_mode->fps;
++	AP1302->frame_interval = v4l2_ctrl_new_custom(ctrl_hdlr, &AP1302_frame_interval, NULL);
++
++	AP1302->pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &AP1302_ctrl_ops, V4L2_CID_PIXEL_RATE, get_pixel_rate(AP1302), get_pixel_rate(AP1302), 1, get_pixel_rate(AP1302));
++	if (AP1302->pixel_rate)
++		AP1302->pixel_rate->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	AP1302->hblank = v4l2_ctrl_new_std(ctrl_hdlr, &AP1302_ctrl_ops, V4L2_CID_HBLANK, 0, 1, 1, 1);
++	if (AP1302->hblank)
++		AP1302->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	AP1302_q_sub_stream.qmenu_int = &AP1302->sub_stream;
++	AP1302->query_sub_stream = v4l2_ctrl_new_custom(ctrl_hdlr, &AP1302_q_sub_stream, NULL);
++	if (ctrl_hdlr->error) {
++		dev_dbg(&client->dev, "new query sub stream ctrl, error = %d.\n",
++			ctrl_hdlr->error);
++		return ctrl_hdlr->error;
++	}
++
++	AP1302->set_sub_stream = v4l2_ctrl_new_custom(ctrl_hdlr, &AP1302_s_sub_stream, NULL);
++	if (ctrl_hdlr->error) {
++		dev_dbg(&client->dev, "new set sub stream ctrl, error = %d.\n",
++			ctrl_hdlr->error);
++		return ctrl_hdlr->error;
++	}
++
++	if (ctrl_hdlr->error)
++		return ctrl_hdlr->error;
++
++	AP1302->sd.ctrl_handler = ctrl_hdlr;
++
++	return ret;
++}
++
++static void AP1302_update_pad_format(const struct AP1302_mode *mode,
++				     struct v4l2_mbus_framefmt *fmt)
++{
++	fmt->width = mode->width;
++	fmt->height = mode->height;
++	fmt->code = mode->code;
++	fmt->field = V4L2_FIELD_NONE;
++}
++
++static int AP1302_start_streaming(struct AP1302 *AP1302)
++{
++	int ret = 0;
++
++	dev_info (AP1302->sd.dev, "AP1302_start_streaming\n");
++
++	msleep_range(3);
++	msleep(1000);
++
++	ret = AP1302_write_reg (AP1302, PREVIEW_HINF_CTRL_ADDR, AP1302_REG_VALUE_16BIT, 0x0032);
++	if (ret) {
++		dev_err (AP1302->sd.dev, "error AP1302 start streaming %X = 0x0032", PREVIEW_HINF_CTRL_ADDR);
++		return ret;
++	}
++	msleep(100);
++
++	ret = AP1302_write_reg (AP1302, PREVIEW_OUT_FMT_ADDR, AP1302_REG_VALUE_16BIT, 0x0050);
++	if (ret) {
++		dev_err (AP1302->sd.dev, "error AP1302 start streaming %X = 0x0050", PREVIEW_OUT_FMT_ADDR);
++		return ret;
++	}
++	msleep(100);
++
++	ret = AP1302_write_reg (AP1302, PREVIEW_MIPI_CTRL_ADDR, AP1302_REG_VALUE_16BIT, 0x1E1E);
++	if (ret) {
++		dev_err (AP1302->sd.dev, "error AP1302 start streaming %X = 0x1E1E", PREVIEW_MIPI_CTRL_ADDR);
++		return ret;
++	}
++	msleep(100);
++
++	ret = AP1302_write_reg (AP1302, PREVIEW_MAX_FPS_ADDR, AP1302_REG_VALUE_16BIT, 0x3C00);
++	if (ret) {
++		dev_err (AP1302->sd.dev, "error AP1302 start streaming %X = 0x3C00", PREVIEW_MAX_FPS_ADDR);
++		return ret;
++	}
++
++	AP1302->set_sub_stream->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++	ret = __v4l2_ctrl_handler_setup(AP1302->sd.ctrl_handler);
++	AP1302->set_sub_stream->flags &= ~V4L2_CTRL_FLAG_READ_ONLY;
++	if (ret)
++		return ret;
++
++
++	return ret;
++}
++
++static void AP1302_stop_streaming(struct AP1302 *AP1302)
++{
++	return;
++}
++
++static int AP1302_set_stream(struct v4l2_subdev *sd, int enable)
++{
++	struct AP1302 *AP1302 = to_AP1302(sd);
++	int ret = 0;
++
++	dev_dbg (sd->dev, "AP1302_set_stream\n");
++	if (AP1302->streaming == enable)
++		return 0;
++
++	mutex_lock(&AP1302->mutex);
++	if (enable) {
++		dev_dbg(sd->dev, "[%s()], start streaming.\n", __func__);
++		ret = AP1302_start_streaming(AP1302);
++		if (ret) {
++			enable = 0;
++			AP1302_stop_streaming(AP1302);
++		}
++	} else {
++		dev_dbg(sd->dev, "[%s()], stop streaming.\n", __func__);
++		AP1302_stop_streaming(AP1302);
++	}
++
++	AP1302->streaming = enable;
++	mutex_unlock(&AP1302->mutex);
++
++	return ret;
++}
++
++static int AP1302_g_frame_interval(struct v4l2_subdev *sd,
++		struct v4l2_subdev_frame_interval *fival)
++{
++	struct AP1302 *AP1302 = to_AP1302(sd);
++
++	fival->pad = 0;
++	fival->interval.numerator = 1;
++	fival->interval.denominator = AP1302->cur_mode->fps;
++
++	return 0;
++}
++
++static int __maybe_unused AP1302_suspend(struct device *dev)
++{
++	struct i2c_client *client = to_i2c_client(dev);
++	struct v4l2_subdev *sd = i2c_get_clientdata(client);
++	struct AP1302 *AP1302 = to_AP1302(sd);
++
++	mutex_lock(&AP1302->mutex);
++	if (AP1302->streaming)
++		AP1302_stop_streaming(AP1302);
++
++	mutex_unlock(&AP1302->mutex);
++
++	return 0;
++}
++
++static int __maybe_unused AP1302_resume(struct device *dev)
++{
++	struct i2c_client *client = to_i2c_client(dev);
++	struct v4l2_subdev *sd = i2c_get_clientdata(client);
++	struct AP1302 *AP1302 = to_AP1302(sd);
++	int ret;
++
++	mutex_lock(&AP1302->mutex);
++	if (AP1302->streaming) {
++		ret = AP1302_start_streaming(AP1302);
++		if (ret) {
++			AP1302->streaming = false;
++			AP1302_stop_streaming(AP1302);
++			mutex_unlock(&AP1302->mutex);
++			return ret;
++		}
++	}
++
++	mutex_unlock(&AP1302->mutex);
++
++	return 0;
++}
++
++static int AP1302_set_format(struct v4l2_subdev *sd,
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
++			     struct v4l2_subdev_pad_config *cfg,
++#else
++			     struct v4l2_subdev_state *sd_state,
++#endif
++			     struct v4l2_subdev_format *fmt)
++{
++	struct AP1302 *AP1302 = to_AP1302(sd);
++	struct i2c_client *client = v4l2_get_subdevdata(&AP1302->sd);
++	const struct AP1302_mode *mode;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(supported_modes); i++) {
++		if (supported_modes[i].width != fmt->format.width
++			|| supported_modes[i].height != fmt->format.height) {
++			dev_dbg(&client->dev, "resolution doesn't match\n");
++			continue;
++		}
++		if (supported_modes[i].code != fmt->format.code) {
++			dev_dbg(&client->dev, "pixel format doesn't match\n");
++			continue;
++		}
++		mode = &supported_modes[i];
++		break;
++	}
++
++	if (i >= ARRAY_SIZE(supported_modes))
++		mode = &supported_modes[0];
++
++	mutex_lock(&AP1302->mutex);
++	AP1302_update_pad_format(mode, &fmt->format);
++	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
++		*v4l2_subdev_get_try_format(sd, cfg, fmt->pad) = fmt->format;
++#else
++		*v4l2_subdev_get_try_format(sd, sd_state, fmt->pad) = fmt->format;
++#endif
++	} else {
++		AP1302->cur_mode = mode;
++		set_sub_stream_fmt(&AP1302->sub_stream, mode->code);
++		set_sub_stream_h(&AP1302->sub_stream, mode->height);
++		set_sub_stream_w(&AP1302->sub_stream, mode->width);
++		set_sub_stream_dt(&AP1302->sub_stream, mbus_code_to_mipi(mode->code));
++		set_sub_stream_vc_id(&AP1302->sub_stream, 0);
++	}
++
++	mutex_unlock(&AP1302->mutex);
++
++	return 0;
++}
++
++static int AP1302_get_format(struct v4l2_subdev *sd,
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
++			     struct v4l2_subdev_pad_config *cfg,
++#else
++			     struct v4l2_subdev_state *sd_state,
++#endif
++			     struct v4l2_subdev_format *fmt)
++{
++	struct AP1302 *AP1302 = to_AP1302(sd);
++
++	mutex_lock(&AP1302->mutex);
++	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
++		fmt->format = *v4l2_subdev_get_try_format(&AP1302->sd, cfg,
++							  fmt->pad);
++#else
++		fmt->format = *v4l2_subdev_get_try_format(&AP1302->sd,
++							  sd_state, fmt->pad);
++#endif
++	else
++		AP1302_update_pad_format(AP1302->cur_mode, &fmt->format);
++
++	mutex_unlock(&AP1302->mutex);
++
++	return 0;
++}
++
++static int AP1302_enum_mbus_code(struct v4l2_subdev *sd,
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
++				 struct v4l2_subdev_pad_config *cfg,
++#else
++				 struct v4l2_subdev_state *sd_state,
++#endif
++				 struct v4l2_subdev_mbus_code_enum *code)
++{
++	if (code->index >= ARRAY_SIZE(supported_formats))
++		return -EINVAL;
++
++	code->code = supported_formats[code->index];
++
++	return 0;
++}
++
++static int AP1302_enum_frame_size(struct v4l2_subdev *sd,
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
++				  struct v4l2_subdev_pad_config *cfg,
++#else
++				  struct v4l2_subdev_state *sd_state,
++#endif
++				  struct v4l2_subdev_frame_size_enum *fse)
++{
++	if (fse->index >= ARRAY_SIZE(supported_modes))
++		return -EINVAL;
++
++	fse->min_width = supported_modes[fse->index].width;
++	fse->max_width = fse->min_width;
++	fse->min_height = supported_modes[fse->index].height;
++	fse->max_height = fse->min_height;
++
++	return 0;
++}
++
++static int AP1302_enum_frame_interval(struct v4l2_subdev *subdev,
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
++		struct v4l2_subdev_pad_config *cfg,
++#else
++		struct v4l2_subdev_state *sd_state,
++#endif
++		struct v4l2_subdev_frame_interval_enum *fie)
++{
++	struct AP1302 *AP1302 = to_AP1302(subdev);
++
++	fie->interval.numerator = 1;
++	fie->interval.denominator = AP1302->cur_mode->fps;
++
++	return 0;
++}
++
++static int AP1302_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
++{
++	struct AP1302 *AP1302 = to_AP1302(sd);
++
++	mutex_lock(&AP1302->mutex);
++	AP1302_update_pad_format(&supported_modes[0],
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
++				 v4l2_subdev_get_try_format(sd, fh->pad, 0));
++#else
++				 v4l2_subdev_get_try_format(sd, fh->state, 0));
++#endif
++	mutex_unlock(&AP1302->mutex);
++
++	return 0;
++}
++
++static const struct v4l2_subdev_video_ops AP1302_video_ops = {
++	.s_stream = AP1302_set_stream,
++	.g_frame_interval = AP1302_g_frame_interval,
++};
++
++static const struct v4l2_subdev_pad_ops AP1302_pad_ops = {
++	.set_fmt = AP1302_set_format,
++	.get_fmt = AP1302_get_format,
++	.enum_mbus_code = AP1302_enum_mbus_code,
++	.enum_frame_size = AP1302_enum_frame_size,
++	.enum_frame_interval = AP1302_enum_frame_interval,
++};
++
++static const struct v4l2_subdev_ops AP1302_subdev_ops = {
++	.video = &AP1302_video_ops,
++	.pad = &AP1302_pad_ops,
++};
++
++static const struct media_entity_operations AP1302_subdev_entity_ops = {
++	.link_validate = v4l2_subdev_link_validate,
++};
++
++static const struct v4l2_subdev_internal_ops AP1302_internal_ops = {
++	.open = AP1302_open,
++};
++
++static int AP1302_identify_module(struct AP1302 *AP1302)
++{
++	struct i2c_client *client = v4l2_get_subdevdata(&AP1302->sd);
++	int ret;
++	u32 val;
++
++	ret = AP1302_read_reg(AP1302, AP1302_REG_CHIP_ID,
++			      AP1302_REG_VALUE_16BIT, &val);
++	if (ret)
++		return ret;
++
++	if (val != AP1302_CHIP_ID) {
++		dev_err(&client->dev, "chip id mismatch: %x!=%x",
++			AP1302_CHIP_ID, val);
++		return -ENXIO;
++	}
++
++	return 0;
++}
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
++static int AP1302_remove(struct i2c_client *client)
++#else
++static void AP1302_remove(struct i2c_client *client)
++#endif
++{
++	struct v4l2_subdev *sd = i2c_get_clientdata(client);
++	struct AP1302 *AP1302 = to_AP1302(sd);
++
++	v4l2_async_unregister_subdev(sd);
++	media_entity_cleanup(&sd->entity);
++	v4l2_ctrl_handler_free(sd->ctrl_handler);
++	pm_runtime_disable(&client->dev);
++	mutex_destroy(&AP1302->mutex);
++
++	#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
++		return 0;
++	#else
++		return;
++	#endif
++
++}
++
++irqreturn_t AP1302_threaded_irq_fn(int irq, void *dev_id)
++{
++	struct AP1302 *AP1302 = dev_id;
++
++	if ((AP1302->platform_data->gpios[0] != -1) && (AP1302->platform_data->irq_pin != -1)) {
++		mutex_lock(&AP1302->mutex);
++		if (AP1302->streaming == false) {
++			gpio_set_value(AP1302->platform_data->gpios[0], 0);
++			goto AP1302_irq_handled;
++		}
++
++		if (AP1302->strobe_source->val == V4L2_FLASH_STROBE_SOURCE_EXTERNAL) {
++			gpio_set_value(AP1302->platform_data->gpios[0],
++					gpio_get_value(AP1302->platform_data->irq_pin));
++		}
++
++AP1302_irq_handled:
++		mutex_unlock(&AP1302->mutex);
++	}
++
++	return IRQ_HANDLED;
++}
++
++static int pca9536_device_init (struct AP1302 *AP1302)
++{
++	struct device *dev = AP1302->sd.dev;
++	struct i2c_client *client = v4l2_get_subdevdata(&AP1302->sd);
++	int ret = 0;
++	static struct regmap_config pca_regmap_config = {
++		.reg_bits = 8,
++		.val_bits = 8,
++	};
++	static struct i2c_board_info board_info = {
++		I2C_BOARD_INFO("pca", 0x41)
++	};
++
++	AP1302->pca9536.adapter = i2c_get_adapter (client->adapter->nr);
++	// AP1302->pca9536.board_info = board_info; -- in now term, there's no other place need it.
++	AP1302->pca9536.i2c_client = i2c_new_client_device (AP1302->pca9536.adapter, &board_info);
++	AP1302->pca9536.regmap = devm_regmap_init_i2c (AP1302->pca9536.i2c_client, &pca_regmap_config);
++	if (IS_ERR (AP1302->pca9536.regmap)) {
++		dev_err(dev, "error in pca9536 regmap: %d", ret);
++		return PTR_ERR (AP1302->pca9536.regmap);
++	}
++
++	return ret;
++}
++
++static int ap1302_reset (struct AP1302 *AP1302)
++{
++	int ret = 0;
++
++	ret = PCA9536_write_reg (AP1302, PCA9536_OUTPUT, PCA9536_STANDBY_N);
++	if (ret) {
++		dev_err (AP1302->sd.dev, "error write 0x%lX to pca9536: %d", PCA9536_STANDBY_N, ret);
++		return ret;
++	}
++	usleep_range(10000, 11000);
++
++	ret = PCA9536_write_reg (AP1302, PCA9536_CONFIG, 0xA);
++	if (ret) {
++		dev_err (AP1302->sd.dev, "error write 0xA to pca9536: %d", ret);
++		return ret;
++	}
++	usleep_range(500000, 510000);
++
++	ret = PCA9536_write_reg (AP1302, PCA9536_OUTPUT, PCA9536_PWR_EN);
++	if (ret) {
++		dev_err (AP1302->sd.dev, "error write 0x%lX to pca9536: %d", PCA9536_PWR_EN, ret);
++		return ret;
++	}
++	usleep_range(305000, 804000); /* t1 + t2 + t3 + t4 */
++
++	ret = PCA9536_write_reg (AP1302, PCA9536_OUTPUT, PCA9536_RST | PCA9536_PWR_EN);
++	if (ret) {
++		dev_err (AP1302->sd.dev, "error write 0x%lX to pca9536: %d", PCA9536_RST | PCA9536_PWR_EN, ret);
++		return ret;
++	}
++	usleep_range(10000, 11000);
++
++	return ret;
++}
++
++static int ap1302_request_firmware (struct AP1302 *AP1302)
++{
++	const struct AP1302_firmware *firmware_header;
++	unsigned int firmware_size = 0;
++	int ret = 0;
++
++	dev_info (AP1302->sd.dev, "requesting firmware : %s\n", AP1302_FIRMWARE_FILENAME);
++	ret = request_firmware (&AP1302->firmware, AP1302_FIRMWARE_FILENAME, AP1302->sd.dev);
++	if (ret) {
++		dev_err (AP1302->sd.dev, "error to request ap11302 firmware: %d", ret);
++		return ret;
++	}
++
++	// Check firmware is requested
++	if (!AP1302->firmware) {
++		dev_err (AP1302->sd.dev, "firmware not requested");
++		return -EINVAL;
++	}
++
++	// Check firmware size
++	firmware_header = (const struct AP1302_firmware *) AP1302->firmware->data;
++	firmware_size = AP1302->firmware->size - sizeof(*firmware_header);
++	if (firmware_header->pll_init_size > firmware_size) {
++		dev_err (AP1302->sd.dev, "invalid firmware, size too large: %d", ret);
++		return -EINVAL;
++	}
++
++	dev_info (AP1302->sd.dev, "firmware_size : %d, firmware_header->pll_init_size : %hd\n", firmware_size, firmware_header->pll_init_size);
++	return ret;
++}
++
++static int ap1302_write_firmware_window (struct AP1302 *AP1302, u16 *win_pos, const u8 *buf, u32 len)
++{
++	int ret = 0;
++	u32 pos;
++	u32 sub_len;
++
++	for (pos = 0; pos < len; pos += sub_len) {
++		/* Checking remaining addresses in window */
++		if (len - pos < AP1302_FIRMWARE_WINDOW_SIZE - *win_pos)
++			sub_len = len - pos;
++		else
++			sub_len = AP1302_FIRMWARE_WINDOW_SIZE - *win_pos;
++
++		/* Limiting max addresses to use per write to 0x0FF0,
++		 * more addresses in one write will fail */
++		if (sub_len >  AP1302_FIRMWARE_BUFFER)
++			sub_len = AP1302_FIRMWARE_BUFFER;
++
++		ret = regmap_raw_write(AP1302->regmap, *win_pos + AP1302_FIRMWARE_WINDOW_OFFSET, buf + pos, sub_len);
++		if (ret < 0) {
++			dev_err(AP1302->sd.dev, "error to write %d bytes to address 0x%x\n", sub_len, pos);
++			return ret;
++		}
++
++		*win_pos += sub_len;
++		if (*win_pos >= AP1302_FIRMWARE_WINDOW_SIZE)
++			*win_pos = 0;
++	}
++	return 0;
++}
++
++static int ap1302_reg_polling (struct AP1302 *AP1302, u16 addr, u16 val, u16 mask, int poll_interval_ms, int retries)
++{
++	u32 reg_val = 0;
++	int ret = 0;
++
++	if (retries <= 0) {
++		dev_err(AP1302->sd.dev, "Polling error: retries is not a positive value\n");
++		return -EINVAL;
++	}
++
++	while (retries > 0) {
++		ret = AP1302_read_reg(AP1302, addr, AP1302_REG_VALUE_16BIT, &reg_val);
++		if (ret < 0)
++			return ret;
++
++		if ((reg_val & mask) == val)
++			break;
++
++		msleep(poll_interval_ms);
++		retries--;
++	}
++
++	if (retries == 0) {
++		dev_err(AP1302->sd.dev, "Polling match fail: read=0x%x, expected=0x%x\n", (reg_val & mask), val);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int ap1302_load_firmware (struct AP1302 *AP1302)
++{
++	struct i2c_client *client = v4l2_get_subdevdata(&AP1302->sd);
++	const struct AP1302_firmware *firmware_header;
++	const u8 *firmware_data;
++	u32 reg_value_check;
++	u16 win_pos = 0;
++	int ret = 0;
++
++	ret = ap1302_request_firmware (AP1302);
++	if (ret) {
++		dev_err (&client->dev, "error in ap1302_request_firmware: %d", ret);
++		return ret;
++	}
++
++	/* clear CRC register */
++	ret = AP1302_write_reg (AP1302, AP1302_SIP_CRC, AP1302_REG_VALUE_16BIT, 0xFFFF);
++	if (ret) {
++		dev_err (&client->dev, "error in clear CRC register: %d", ret);
++		return ret;
++	}
++
++	/* load firmware data for pll init stage */
++	firmware_header = (const struct AP1302_firmware *)AP1302->firmware->data;
++	firmware_data = (u8 *)&firmware_header[1];
++	ret = ap1302_write_firmware_window (AP1302, &win_pos, firmware_data, firmware_header->pll_init_size);
++	if (ret) {
++		dev_err (&client->dev, "error in firmware PLL init: %d", ret);
++		return ret;
++	}
++
++	/* to enable PLL */
++	ret = AP1302_write_reg (AP1302, AP1302_BOOTDATA_STAGE, AP1302_REG_VALUE_16BIT, 0x0002);
++	if (ret) {
++		dev_err (&client->dev, "error to write 0x0002 to bootdata stage: %d", ret);
++		return ret;
++	}
++
++	/* wait 1ms for PLL to lock */
++	usleep_range(1000, 2000);
++
++	/* load rest of bootdata */
++	ret = ap1302_write_firmware_window (AP1302, &win_pos, firmware_data + firmware_header->pll_init_size, AP1302->firmware->size - firmware_header->pll_init_size - sizeof (*firmware_header));
++	if (ret) {
++		dev_err (&client->dev, "error to load remain bootdata: %d", ret);
++		return ret;
++	}
++
++	msleep(40);
++
++	/* check firmware CRC */
++	ret = AP1302_read_reg (AP1302, AP1302_BOOTDATA_STAGE, AP1302_REG_VALUE_16BIT, &reg_value_check);
++	if (ret)
++	{
++		dev_err (&client->dev, "error to read from bootdata stage: %d", ret);
++		return ret;
++	}
++	if (reg_value_check != (u32)firmware_header->crc) {
++		dev_warn (&client->dev, "CRC mismatch , expected 0x%04X, got 0x%04X", firmware_header->crc, reg_value_check);
++	}
++
++	/* to indicate sensor the whole bootdata content has been loaded */
++	ret = AP1302_write_reg (AP1302, AP1302_BOOTDATA_STAGE, AP1302_REG_VALUE_16BIT, 0xFFFF);
++	if (ret) {
++		dev_err (&client->dev, "error to write 0xFFFF to bootdata stage: %d", ret);
++		return ret;
++	}
++
++	msleep(400);
++
++	/* ensure firmware was loaded correctly */
++	ret = ap1302_reg_polling (AP1302, AP1302_BOOTDATA_STAGE, 0xFFFF, 0xFFFF, 5, 50);
++	if (ret < 0) {
++		dev_err(&client->dev, "AP1302 failed to process boot data\n");
++		return -EINVAL;
++	}
++
++	return ret;
++}
++
++/* Call AP1302 to wake up by pca9536 */
++int ap1302_board_setup (struct AP1302 *AP1302)
++{
++	int ret = 0;
++	struct device *dev = AP1302->sd.dev;
++
++	ret = pca9536_device_init (AP1302);
++	if (ret) {
++		dev_err (dev, "error to init pca9536 in ap1302: %d", ret);
++		return ret;
++	}
++	dev_info (dev, "pca9536 init success");
++
++	ret = ap1302_reset (AP1302);
++	if (ret) {
++		dev_err (dev, "error to reset sensor: %d", ret);
++		return ret;
++	}
++	dev_info (dev, "ap1302 reset success.\n");
++
++	ret = ap1302_load_firmware (AP1302);
++	if (ret) {
++		dev_err (dev, "error to load firmware: %d", ret);
++		return ret;
++	}
++	dev_info (dev, "ap1302 load firmware success.\n");
++
++	return ret;
++}
++
++static int AP1302_probe(struct i2c_client *client)
++{
++	struct AP1302 *AP1302;
++	int ret;
++
++	AP1302 = devm_kzalloc(&client->dev, sizeof(*AP1302), GFP_KERNEL);
++	if (!AP1302)
++		return -ENOMEM;
++
++	AP1302->platform_data = client->dev.platform_data;
++	if (AP1302->platform_data == NULL) {
++		dev_err(&client->dev, "no platform data provided\n");
++		return -EINVAL;
++	}
++
++	v4l2_i2c_subdev_init(&AP1302->sd, client, &AP1302_subdev_ops);
++
++	ret = AP1302_identify_module(AP1302);
++	if (ret) {
++		dev_err(&client->dev, "failed to find sensor: %d", ret);
++		return ret;
++	}
++
++	if (AP1302->platform_data->suffix)
++		snprintf(AP1302->sd.name,
++				sizeof(AP1302->sd.name), "EV2M-OOM1 %c",
++				AP1302->platform_data->suffix);
++
++	mutex_init(&AP1302->mutex);
++	AP1302->cur_mode = &supported_modes[0];
++	ret = AP1302_init_controls(AP1302);
++	if (ret) {
++		dev_err(&client->dev, "failed to init controls: %d", ret);
++		goto probe_error_v4l2_ctrl_handler_free;
++	}
++
++	AP1302->sd.internal_ops = &AP1302_internal_ops;
++	AP1302->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
++	AP1302->sd.entity.ops = &AP1302_subdev_entity_ops;
++	AP1302->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
++	AP1302->pad.flags = MEDIA_PAD_FL_SOURCE;
++	ret = media_entity_pads_init(&AP1302->sd.entity, 1, &AP1302->pad);
++	if (ret) {
++		dev_err(&client->dev, "failed to init entity pads: %d", ret);
++		goto probe_error_v4l2_ctrl_handler_free;
++	}
++
++	ret = ap1302_board_setup(AP1302);
++	if (ret)
++	{
++		dev_err(&client->dev, "board setup failed: %d", ret);
++		goto probe_error_media_entity_cleanup;
++	}
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
++	ret = v4l2_async_register_subdev_sensor_common(&AP1302->sd);
++#else
++	ret = v4l2_async_register_subdev_sensor(&AP1302->sd);
++#endif
++	if (ret < 0) {
++		dev_err(&client->dev, "failed to register V4L2 subdev: %d",
++			ret);
++		goto probe_error_media_entity_cleanup;
++	}
++
++	/*
++	 * Device is already turned on by i2c-core with ACPI domain PM.
++	 * Enable runtime PM and turn off the device.
++	 */
++	pm_runtime_set_active(&client->dev);
++	pm_runtime_enable(&client->dev);
++	pm_runtime_idle(&client->dev);
++
++	return 0;
++
++probe_error_media_entity_cleanup:
++	media_entity_cleanup(&AP1302->sd.entity);
++
++probe_error_v4l2_ctrl_handler_free:
++	v4l2_ctrl_handler_free(AP1302->sd.ctrl_handler);
++	mutex_destroy(&AP1302->mutex);
++
++	return ret;
++}
++
++static const struct dev_pm_ops AP1302_pm_ops = {
++	SET_SYSTEM_SLEEP_PM_OPS(AP1302_suspend, AP1302_resume)
++};
++
++static const struct i2c_device_id AP1302_id_table[] = {
++	{ "ev2m_oom1", 0 },
++	{ /* sentinel */ },
++};
++MODULE_DEVICE_TABLE(i2c, AP1302_id_table);
++
++static struct i2c_driver AP1302_i2c_driver = {
++	.driver = {
++		.name = "ev2m_oom1",
++		.pm = &AP1302_pm_ops,
++	},
++	.probe_new = AP1302_probe,
++	.remove = AP1302_remove,
++	.id_table = AP1302_id_table,
++};
++
++module_i2c_driver(AP1302_i2c_driver);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Nessa, Li <nessa_li@innodisk.com>");
++MODULE_DESCRIPTION("Innodisk EV2M-OOM1 V4L2 driver");
++MODULE_ALIAS("Innodisk EV2M-OOM1");
++MODULE_VERSION("v1.0");
++
++/*
++ *	v1.0: first steady version
++ *
++ */
