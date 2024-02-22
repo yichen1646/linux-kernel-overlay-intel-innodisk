@@ -42,16 +42,12 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 ===================================================================
 --- /dev/null
 +++ linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
-@@ -0,0 +1,896 @@
-+// SPDX-License-Identifier: GPL-2.0
-+// Copyright (c) 2022 Intel Corporation.
-+
+@@ -0,0 +1,1026 @@
 +#include <asm/unaligned.h>
 +#include <linux/acpi.h>
 +#include <linux/delay.h>
 +#include <linux/i2c.h>
 +#include <linux/module.h>
-+#include <linux/pm_runtime.h>
 +#include <linux/gpio.h>
 +#include <linux/version.h>
 +#include <linux/interrupt.h>
@@ -66,6 +62,11 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +#define GL3004_REG_VALUE_08BIT			1
 +#define GL3004_REG_VALUE_16BIT			2
 +
++#define GL3004_VERSION_LEN_MAX			64
++
++#define GL3004_REG_DISPLAY_MODE			0x0A42
++#define GL3004_REG_DEFAULT_DISPLAY_MODE	0x0A46
++#define GL3004_REG_MIRROR_FLIP			0x0A4D
 +#define GL3004_REG_CHIP_ID				0x0A50
 +#define GL3004_CHIP_ID					0x3004
 +
@@ -77,10 +78,17 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +#define GL3004_CID_I2C_SLAVE_ADDRESS	(V4L2_CID_USER_BASE | 0x1004)
 +#define GL3004_CID_FPS         			(V4L2_CID_USER_BASE | 0x1005)
 +#define GL3004_CID_FRAME_INTERVAL		(V4L2_CID_USER_BASE | 0x1006)
++#define GL3004_CID_FIRMWARE_VERSION		(V4L2_CID_USER_BASE | 0x1007)
++#define GL3004_CID_CHIP_ID				(V4L2_CID_USER_BASE | 0x1008)
++#define GL3004_CID_DISPLAY_MODE			(V4L2_CID_USER_BASE | 0x1009)
++#define GL3004_CID_DEFAULT_DISPLAY_MODE	(V4L2_CID_USER_BASE | 0x100A)
++#define GL3004_CID_MIRROR_FLIP			(V4L2_CID_USER_BASE | 0x100B)
 +
 +#define to_GL3004(_sd)					container_of(_sd, struct GL3004, sd)
 +
 +#define MIPI_CSI2_TYPE_YUV422_8			0x1e
++
++u8 GL3004_fw_ver[GL3004_VERSION_LEN_MAX] = "";
 +
 +struct GL3004_mode {
 +	/* Frame width in pixels */
@@ -144,9 +152,6 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +	struct v4l2_ctrl *exposure;
 +	struct v4l2_ctrl *analogue_gain;
 +	struct v4l2_ctrl *digital_gain;
-+	struct v4l2_ctrl *strobe_source;
-+	struct v4l2_ctrl *strobe;
-+	struct v4l2_ctrl *strobe_stop;
 +	struct v4l2_ctrl *timeout;
 +	struct v4l2_ctrl *csi_port;
 +	struct v4l2_ctrl *i2c_bus;
@@ -158,6 +163,11 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +	struct v4l2_ctrl *hblank;
 +	struct v4l2_ctrl *vflip;
 +	struct v4l2_ctrl *hflip;
++	struct v4l2_ctrl *firmware_version;
++	struct v4l2_ctrl *chip_id;
++	struct v4l2_ctrl *display_mode;
++	struct v4l2_ctrl *default_display_mode;
++	struct v4l2_ctrl *mirror_flip;
 +	struct v4l2_ctrl *query_sub_stream;
 +	struct v4l2_ctrl *set_sub_stream;
 +
@@ -238,10 +248,6 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +	struct i2c_client *client = v4l2_get_subdevdata(&GL3004->sd);
 +	int ret = 0;
 +
-+	/* V4L2 controls values will be applied only when power is already up */
-+	if (!pm_runtime_get_if_in_use(&client->dev))
-+		return 0;
-+
 +	switch (ctrl->id) {
 +	case V4L2_CID_ANALOGUE_GAIN:
 +		dev_dbg(&client->dev, "set analogue gain.\n");
@@ -260,7 +266,26 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +		break;
 +
 +	case V4L2_CID_IPU_QUERY_SUB_STREAM:
-+		dev_dbg(&client->dev, "query stream.\n");
++		dev_dbg(&client->dev, "IPU query sub stream.\n");
++		break;
++
++	case V4L2_CID_IPU_SET_SUB_STREAM:
++		dev_dbg(&client->dev, "IPU set sub stream.\n");
++		break;
++
++	case GL3004_CID_DISPLAY_MODE:
++		dev_dbg(&client->dev, "set display mode.\n");
++		ret = GL3004_write_reg(GL3004, GL3004_REG_DISPLAY_MODE, GL3004_REG_VALUE_08BIT, ctrl->val);
++		break;
++
++	case GL3004_CID_DEFAULT_DISPLAY_MODE:
++		dev_dbg(&client->dev, "set default display mode.\n");
++		ret = GL3004_write_reg(GL3004, GL3004_REG_DEFAULT_DISPLAY_MODE, GL3004_REG_VALUE_08BIT, ctrl->val);
++		break;
++
++	case GL3004_CID_MIRROR_FLIP:
++		dev_dbg(&client->dev, "set mirror flip.\n");
++		ret = GL3004_write_reg(GL3004, GL3004_REG_MIRROR_FLIP, GL3004_REG_VALUE_08BIT, ctrl->val);
 +		break;
 +
 +	default:
@@ -268,8 +293,6 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +		ret = -EINVAL;
 +		break;
 +	}
-+
-+	pm_runtime_put(&client->dev);
 +
 +	return ret;
 +}
@@ -350,6 +373,65 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +	.flags	= V4L2_CTRL_FLAG_READ_ONLY,
 +};
 +
++static struct v4l2_ctrl_config GL3004_firmware_version = {
++	.ops	= &GL3004_ctrl_ops,
++	.id		= GL3004_CID_FIRMWARE_VERSION,
++	.type	= V4L2_CTRL_TYPE_STRING,
++	.name	= "firmware version",
++	.min	= 0,
++	.max	= GL3004_VERSION_LEN_MAX,
++	.step	= 1,
++	.flags	= V4L2_CTRL_FLAG_READ_ONLY,
++};
++
++static struct v4l2_ctrl_config GL3004_chip_id = {
++	.ops	= &GL3004_ctrl_ops,
++	.id		= GL3004_CID_CHIP_ID,
++	.type	= V4L2_CTRL_TYPE_INTEGER,
++	.name	= "chip id",
++	.min	= 0,
++	.max	= 0xffff,
++	.def	= 0,
++	.step	= 1,
++	.flags	= V4L2_CTRL_FLAG_READ_ONLY,
++};
++
++static struct v4l2_ctrl_config GL3004_display_mode = {
++	.ops	= &GL3004_ctrl_ops,
++	.id		= GL3004_CID_DISPLAY_MODE,
++	.type	= V4L2_CTRL_TYPE_INTEGER,
++	.name	= "display mode",
++	.min	= 0x00,
++	.max	= 0x08,
++	.def	= 0,
++	.step	= 1,
++	.flags	= 0,
++};
++
++static struct v4l2_ctrl_config GL3004_default_display_mode = {
++	.ops	= &GL3004_ctrl_ops,
++	.id		= GL3004_CID_DEFAULT_DISPLAY_MODE,
++	.type	= V4L2_CTRL_TYPE_INTEGER,
++	.name	= "default display mode",
++	.min	= 0x00,
++	.max	= 0x08,
++	.def	= 0,
++	.step	= 1,
++	.flags	= 0,
++};
++
++static struct v4l2_ctrl_config GL3004_mirror_flip = {
++	.ops	= &GL3004_ctrl_ops,
++	.id		= GL3004_CID_MIRROR_FLIP,
++	.type	= V4L2_CTRL_TYPE_INTEGER,
++	.name	= "mirror flip",
++	.min	= 0x00,
++	.max	= 0x03,
++	.def	= 0,
++	.step	= 1,
++	.flags	= 0,
++};
++
 +static struct v4l2_ctrl_config GL3004_q_sub_stream = {
 +	.ops 	= &GL3004_ctrl_ops,
 +	.id 	= V4L2_CID_IPU_QUERY_SUB_STREAM,
@@ -427,6 +509,7 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +	struct i2c_client *client = v4l2_get_subdevdata(&GL3004->sd);
 +	struct v4l2_ctrl_handler *ctrl_hdlr;
 +	int ret;
++	u32 val;
 +
 +	ctrl_hdlr = &GL3004->ctrl_handler;
 +	ret = v4l2_ctrl_handler_init(ctrl_hdlr, 8);
@@ -454,6 +537,24 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +	GL3004->fps = v4l2_ctrl_new_custom(ctrl_hdlr, &GL3004_fps, NULL);
 +	GL3004_frame_interval.def = 1000 / GL3004->cur_mode->fps;
 +	GL3004->frame_interval = v4l2_ctrl_new_custom(ctrl_hdlr, &GL3004_frame_interval, NULL);
++
++	GL3004->firmware_version = v4l2_ctrl_new_custom(ctrl_hdlr, &GL3004_firmware_version, NULL);
++	GL3004->firmware_version->p_cur.p_char = (char *)GL3004_fw_ver;
++
++	GL3004->chip_id = v4l2_ctrl_new_custom(ctrl_hdlr, &GL3004_chip_id, NULL);
++	GL3004->chip_id->cur.val = GL3004_CHIP_ID;
++
++	if(GL3004_read_reg(GL3004, GL3004_REG_DISPLAY_MODE, GL3004_REG_VALUE_08BIT, &val) == 0)
++		GL3004_display_mode.def = val;
++	GL3004->display_mode = v4l2_ctrl_new_custom(ctrl_hdlr, &GL3004_display_mode, NULL);
++
++	if(GL3004_read_reg(GL3004, GL3004_REG_DEFAULT_DISPLAY_MODE, GL3004_REG_VALUE_08BIT, &val) == 0)
++		GL3004_default_display_mode.def = val;
++	GL3004->default_display_mode = v4l2_ctrl_new_custom(ctrl_hdlr, &GL3004_default_display_mode, NULL);
++
++	if(GL3004_read_reg(GL3004, GL3004_REG_MIRROR_FLIP, GL3004_REG_VALUE_08BIT, &val) == 0)
++		GL3004_mirror_flip.def = val;
++	GL3004->mirror_flip = v4l2_ctrl_new_custom(ctrl_hdlr, &GL3004_mirror_flip, NULL);
 +
 +	GL3004->pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &GL3004_ctrl_ops, V4L2_CID_PIXEL_RATE, get_pixel_rate(GL3004), get_pixel_rate(GL3004), 1, get_pixel_rate(GL3004));
 +	if (GL3004->pixel_rate)
@@ -499,7 +600,6 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +{
 +	int ret;
 +
-+	dev_info (GL3004->sd.dev, "GL3004_start_streaming\n");
 +	GL3004->set_sub_stream->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 +	ret = __v4l2_ctrl_handler_setup(GL3004->sd.ctrl_handler);
 +	GL3004->set_sub_stream->flags &= ~V4L2_CTRL_FLAG_READ_ONLY;
@@ -522,7 +622,6 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +	if (GL3004->streaming == enable)
 +		return 0;
 +
-+	dev_info (sd->dev, "GL3004_set_stream\n");
 +	mutex_lock(&GL3004->mutex);
 +	if (enable) {
 +		dev_dbg(sd->dev, "[%s()], start streaming.\n", __func__);
@@ -784,6 +883,66 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +	return 0;
 +}
 +
++static void GL3004_get_firmware_version(struct GL3004 *GL3004)
++{
++	struct i2c_client *client = v4l2_get_subdevdata(&GL3004->sd);
++	struct i2c_msg msgs[2];
++	int ret;
++	int len										= 0;
++	u8 xdata_to_fw[3]							= {0xFF, 0xFF, 0xF2};
++	u8 fw_to_xdata[2]							= {0x06, 0x01};
++	u8 version_len_reg							= 0x12;
++	u8 version_len_val							= 0;
++	u8 version_data_reg[2]						= {0x13, 0x00};
++	u8 version_data_val[GL3004_VERSION_LEN_MAX] = {0};
++
++	/* <XDATA Access Mode> switch to <FW Update Mode> */
++	len = sizeof(xdata_to_fw) / sizeof(u8);
++	if(i2c_master_send(client, xdata_to_fw, len) != len)
++		return;
++
++	/* Get the length of the firmware version */
++	msgs[0].addr  = client->addr;
++	msgs[0].flags = 0;
++	msgs[0].len   = 1;
++	msgs[0].buf   = &version_len_reg;
++	msgs[1].addr  = client->addr;
++	msgs[1].flags = I2C_M_RD;
++	msgs[1].len   = 1;
++	msgs[1].buf   = &version_len_val;
++
++	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
++	if (ret != ARRAY_SIZE(msgs))
++		return;
++
++	version_data_reg[1] = version_len_val;
++
++	/* Get the string of the firmware version */
++	msgs[0].addr  = client->addr;
++	msgs[0].flags = 0;
++	msgs[0].len   = 2;
++	msgs[0].buf   = version_data_reg;
++	msgs[1].addr  = client->addr;
++	msgs[1].flags = I2C_M_RD;
++	msgs[1].len   = version_len_val;
++	msgs[1].buf   = version_data_val;
++
++	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
++	if (ret != ARRAY_SIZE(msgs))
++		return;
++
++	memcpy(GL3004_fw_ver, version_data_val, (GL3004_VERSION_LEN_MAX * sizeof(u8)));
++
++	dev_info(&client->dev, "Firmware Version: %s\n", GL3004_fw_ver);
++
++	/* <FW Update Mode> switch to <XDATA Access Mode> */
++	len = sizeof(fw_to_xdata) / sizeof(u8);
++	if(i2c_master_send(client, fw_to_xdata, len) != len)
++		return;
++
++	return;
++}
++
 +#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
 +static int GL3004_remove(struct i2c_client *client)
 +#else
@@ -796,7 +955,6 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +	v4l2_async_unregister_subdev(sd);
 +	media_entity_cleanup(&sd->entity);
 +	v4l2_ctrl_handler_free(sd->ctrl_handler);
-+	pm_runtime_disable(&client->dev);
 +	mutex_destroy(&GL3004->mutex);
 +
 +	#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
@@ -805,29 +963,6 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +		return;
 +	#endif
 +
-+}
-+
-+irqreturn_t GL3004_threaded_irq_fn(int irq, void *dev_id)
-+{
-+	struct GL3004 *GL3004 = dev_id;
-+
-+	if ((GL3004->platform_data->gpios[0] != -1) && (GL3004->platform_data->irq_pin != -1)) {
-+		mutex_lock(&GL3004->mutex);
-+		if (GL3004->streaming == false) {
-+			gpio_set_value(GL3004->platform_data->gpios[0], 0);
-+			goto GL3004_irq_handled;
-+		}
-+
-+		if (GL3004->strobe_source->val == V4L2_FLASH_STROBE_SOURCE_EXTERNAL) {
-+			gpio_set_value(GL3004->platform_data->gpios[0],
-+					gpio_get_value(GL3004->platform_data->irq_pin));
-+		}
-+
-+GL3004_irq_handled:
-+		mutex_unlock(&GL3004->mutex);
-+	}
-+
-+	return IRQ_HANDLED;
 +}
 +
 +static int GL3004_probe(struct i2c_client *client)
@@ -851,6 +986,8 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +		dev_err(&client->dev, "failed to find sensor: %d", ret);
 +		return ret;
 +	}
++
++	GL3004_get_firmware_version(GL3004);
 +
 +	if (GL3004->platform_data->suffix)
 +		snprintf(GL3004->sd.name,
@@ -887,14 +1024,6 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +		goto probe_error_media_entity_cleanup;
 +	}
 +
-+	/*
-+	 * Device is already turned on by i2c-core with ACPI domain PM.
-+	 * Enable runtime PM and turn off the device.
-+	 */
-+	pm_runtime_set_active(&client->dev);
-+	pm_runtime_enable(&client->dev);
-+	pm_runtime_idle(&client->dev);
-+
 +	return 0;
 +
 +probe_error_media_entity_cleanup:
@@ -907,10 +1036,6 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +	return ret;
 +}
 +
-+static const struct dev_pm_ops GL3004_pm_ops = {
-+	SET_SYSTEM_SLEEP_PM_OPS(GL3004_suspend, GL3004_resume)
-+};
-+
 +static const struct i2c_device_id GL3004_id_table[] = {
 +	{ "ev2m_gom1", 0 },
 +	{ /* sentinel */ },
@@ -920,7 +1045,6 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +static struct i2c_driver GL3004_i2c_driver = {
 +	.driver = {
 +		.name = "ev2m_gom1",
-+		.pm = &GL3004_pm_ops,
 +	},
 +	.probe_new = GL3004_probe,
 +	.remove = GL3004_remove,
@@ -933,10 +1057,16 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_gom1.c
 +MODULE_AUTHOR("Yi-Chen, Liu <yichen_liu@innodisk.com>");
 +MODULE_DESCRIPTION("Innodisk EV2M-GOM1 V4L2 driver");
 +MODULE_ALIAS("Innodisk EV2M-GOM1");
-+MODULE_VERSION("v1.0");
++MODULE_VERSION("v1.1");
 +
 +/*
 + *	v1.0: first steady version
++ *	v1.1: add V4L2 control
++ *		  - Firmware Version
++ *		  - Chip ID
++ *		  - Display Mode
++ *		  - Default Display Mode
++ *		  - Mirror Flip
 + *
 + */
 Index: linux-kernel-v6.2/include/media/ev2m_gom1.h
