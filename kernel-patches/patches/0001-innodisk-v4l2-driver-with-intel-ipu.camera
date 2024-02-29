@@ -1131,7 +1131,7 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_oom1.c
 ===================================================================
 --- /dev/null
 +++ linux-kernel-v6.2/drivers/media/i2c/ev2m_oom1.c
-@@ -0,0 +1,1275 @@
+@@ -0,0 +1,1277 @@
 +// SPDX-License-Identifier: GPL-2.0
 +// Copyright (c) 2022 Intel Corporation.
 +
@@ -1156,11 +1156,12 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_oom1.c
 +
 +#define AP1302_REG_VALUE_08BIT			1
 +#define AP1302_REG_VALUE_16BIT			2
++#define AP1302_VERSION_LEN_MAX			64
 +
 +#define AP1302_REG_CHIP_ID				0x0000
 +#define AP1302_CHIP_ID					0x0265
 +
-+#define AP1302_LINK_FREQ_62_208MHZ		62208000ULL
++#define AP1302_LINK_FREQ_360MHZ			360000000ULL
 +
 +#define AP1302_CID_CSI_PORT         	(V4L2_CID_USER_BASE | 0x1001)
 +#define AP1302_CID_I2C_BUS         		(V4L2_CID_USER_BASE | 0x1002)
@@ -1228,7 +1229,7 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_oom1.c
 +};
 +
 +static const s64 link_freq_menu_items[] = {
-+	AP1302_LINK_FREQ_62_208MHZ,
++	AP1302_LINK_FREQ_360MHZ,
 +};
 +
 +static const struct AP1302_mode supported_modes[] = {
@@ -2401,9 +2402,10 @@ Index: linux-kernel-v6.2/drivers/media/i2c/ev2m_oom1.c
 +MODULE_AUTHOR("Nessa, Li <nessa_li@innodisk.com>");
 +MODULE_DESCRIPTION("Innodisk EV2M-OOM1 V4L2 driver");
 +MODULE_ALIAS("Innodisk EV2M-OOM1");
-+MODULE_VERSION("v1.0");
++MODULE_VERSION("v1.1");
 +
 +/*
 + *	v1.0: first steady version
++ *	v1.1: fix bug while using on intel 14th
 + *
 + */
